@@ -42,8 +42,9 @@ func TestSearchEndToEnd(t *testing.T) {
 		t.Fatal("no results")
 	}
 	top := results[0]
-	if !strings.Contains(top.Snippet, "backoff") {
-		t.Fatalf("top result not the retries section: %q", top.Snippet)
+	snippet := doc.Text[top.Span.Start:top.Span.End]
+	if !strings.Contains(snippet, "backoff") {
+		t.Fatalf("top result not the retries section: %q", snippet)
 	}
 	// must be localized, not the entire document
 	if top.Span.Start == 0 && top.Span.End == len(doc.Text) {

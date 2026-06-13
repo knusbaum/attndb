@@ -50,6 +50,32 @@ func (MinMax) Normalize(scores []float64) []float64 {
 	return out
 }
 
+// Affine applies a fixed scale (s-Lo)/(Hi-Lo), clamped to [0,1]. Unlike MinMax it
+// is NOT per-query: Lo/Hi are calibrated once (the pass's noise floor and
+// strong-match level), so a query with no real match scores near 0 instead of
+// being stretched to 1. This is what gives the system a "no confident match"
+// signal.
+type Affine struct{ Lo, Hi float64 }
+
+func (a Affine) Normalize(scores []float64) []float64 {
+	out := make([]float64, len(scores))
+	rng := a.Hi - a.Lo
+	for i, s := range scores {
+		if rng <= 0 {
+			continue // degenerate calibration → contribute nothing
+		}
+		v := (s - a.Lo) / rng
+		switch {
+		case v < 0:
+			v = 0
+		case v > 1:
+			v = 1
+		}
+		out[i] = v
+	}
+	return out
+}
+
 // Rank ignores magnitude and uses position only (best=1, descending). The robust
 // fallback when a pass's score distribution is pathological.
 type Rank struct{}

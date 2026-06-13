@@ -6,6 +6,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 
 	"github.com/kjn/attndb/internal/core"
@@ -16,11 +17,21 @@ import (
 // DB is a multi-pass database.
 type DB struct {
 	passes       []pass.Pass
-	norm         heat.Normalizer
+	norm         heat.Normalizer            // default normalizer (per-query min-max)
+	passNorm     map[string]heat.Normalizer // per-pass override (calibrated affine)
 	recallK      int
 	peakFraction float64
-	docText      map[string]string
 }
+
+// PassCalib is a pass's calibrated score range: Lo is the noise floor, Hi a
+// strong-match level. Raw scores are mapped (s-Lo)/(Hi-Lo), clamped to [0,1].
+type PassCalib struct {
+	Lo float64 `json:"lo"`
+	Hi float64 `json:"hi"`
+}
+
+// Calibration maps pass name -> calibrated range.
+type Calibration map[string]PassCalib
 
 // Option configures a DB.
 type Option func(*DB)
@@ -41,7 +52,6 @@ func New(passes []pass.Pass, opts ...Option) *DB {
 		norm:         heat.MinMax{},
 		recallK:      50,
 		peakFraction: 0.5,
-		docText:      map[string]string{},
 	}
 	for _, o := range opts {
 		o(d)
@@ -49,12 +59,24 @@ func New(passes []pass.Pass, opts ...Option) *DB {
 	return d
 }
 
-// Ingest runs every pass over the documents and remembers their text for snippet
-// rendering.
-func (d *DB) Ingest(ctx context.Context, docs []core.Document) error {
-	for _, doc := range docs {
-		d.docText[doc.ID] = doc.Text
+// SetCalibration installs calibrated affine normalizers per pass (replacing the
+// default per-query min-max for those passes).
+func (d *DB) SetCalibration(c Calibration) {
+	d.passNorm = make(map[string]heat.Normalizer, len(c))
+	for name, pc := range c {
+		d.passNorm[name] = heat.Affine{Lo: pc.Lo, Hi: pc.Hi}
 	}
+}
+
+func (d *DB) normalizerFor(pass string) heat.Normalizer {
+	if n, ok := d.passNorm[pass]; ok {
+		return n
+	}
+	return d.norm
+}
+
+// Ingest runs every pass over the documents.
+func (d *DB) Ingest(ctx context.Context, docs []core.Document) error {
 	for _, p := range d.passes {
 		if err := p.Ingest(ctx, docs); err != nil {
 			return fmt.Errorf("ingest pass %s: %w", p.Name(), err)
@@ -79,7 +101,7 @@ func (d *DB) Search(ctx context.Context, q core.Query, limit int) ([]core.Result
 		for i, c := range cands {
 			raw[i] = float64(c.Score)
 		}
-		norm := d.norm.Normalize(raw)
+		norm := d.normalizerFor(p.Name()).Normalize(raw)
 		w := p.Weight()
 		for i, c := range cands {
 			deposits = append(deposits, heat.Deposit{
@@ -94,10 +116,9 @@ func (d *DB) Search(ctx context.Context, q core.Query, limit int) ([]core.Result
 	results := make([]core.Result, 0, len(peaks))
 	for _, pk := range peaks {
 		results = append(results, core.Result{
-			DocID:   pk.DocID,
-			Span:    pk.Span,
-			Score:   float32(pk.Score),
-			Snippet: d.snippet(pk.DocID, pk.Span),
+			DocID: pk.DocID,
+			Span:  pk.Span,
+			Score: float32(pk.Score),
 		})
 	}
 	sort.SliceStable(results, func(i, j int) bool { return results[i].Score > results[j].Score })
@@ -107,15 +128,54 @@ func (d *DB) Search(ctx context.Context, q core.Query, limit int) ([]core.Result
 	return results, nil
 }
 
-func (d *DB) snippet(docID string, span core.Span) string {
-	text, ok := d.docText[docID]
-	if !ok || span.Start < 0 || span.End > len(text) || span.Start >= span.End {
-		return ""
+// Calibrate estimates a per-pass score range from sample (pseudo-)queries:
+// HI = high percentile of the best score per query (strong matches), LO = median
+// of all candidate scores (the middling/weak level). Because in-corpus matches
+// cluster near HI while unrelated queries only reach the middling level, the
+// affine map separates them. Run once at ingest.
+func (d *DB) Calibrate(ctx context.Context, samples []string) (Calibration, error) {
+	all := map[string][]float64{}
+	tops := map[string][]float64{}
+	for _, q := range samples {
+		for _, p := range d.passes {
+			cands, err := p.Deposits(ctx, core.Query{Text: q}, d.recallK)
+			if err != nil {
+				return nil, fmt.Errorf("calibrate %s: %w", p.Name(), err)
+			}
+			if len(cands) == 0 {
+				continue
+			}
+			top := math.Inf(-1)
+			for _, c := range cands {
+				s := float64(c.Score)
+				all[p.Name()] = append(all[p.Name()], s)
+				if s > top {
+					top = s
+				}
+			}
+			tops[p.Name()] = append(tops[p.Name()], top)
+		}
 	}
-	s := text[span.Start:span.End]
-	const max = 240
-	if len(s) > max {
-		s = s[:max] + "…"
+	out := Calibration{}
+	for _, p := range d.passes {
+		a, t := all[p.Name()], tops[p.Name()]
+		if len(a) == 0 || len(t) == 0 {
+			continue
+		}
+		lo, hi := percentile(a, 0.5), percentile(t, 0.9)
+		if hi <= lo {
+			hi = lo + 1e-6
+		}
+		out[p.Name()] = PassCalib{Lo: lo, Hi: hi}
 	}
-	return s
+	return out, nil
+}
+
+func percentile(xs []float64, p float64) float64 {
+	if len(xs) == 0 {
+		return 0
+	}
+	s := append([]float64(nil), xs...)
+	sort.Float64s(s)
+	return s[int(p*float64(len(s)-1))]
 }

@@ -60,6 +60,19 @@ go run ./cmd/attndb -store qdrant -k 3 "retry backoff when the service is unavai
 
 `-store memory` (default) needs no server and is what the tests use.
 
+### Calibration & the relevance gate
+
+`ingest` also **calibrates** each pass's score range (a per-corpus noise floor and
+strong-match level, sampled from pseudo-queries) and writes it to
+`.attndb-calibration.json`. `search` loads it and scales scores with a fixed
+affine map instead of per-query min-max — so a query with no real answer scores
+*low* instead of being stretched to look confident. Add `-min N` to drop results
+below a score (the "no confident match" gate):
+
+```
+attndb search -store qdrant -encoder onnx -docs corpus/ -min 1.0 "your question"
+```
+
 ## Real encoders (ONNX)
 
 The default build uses deterministic *stub* encoders (lexical, for testing the

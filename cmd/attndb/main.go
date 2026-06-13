@@ -1,17 +1,24 @@
-// Command attndb runs the multi-pass database: it ingests a directory of
-// Markdown documents and runs a query, printing ranked, localized results. The
-// store is selectable (in-memory or Qdrant); the encoders here are the stub
-// encoders (real ONNX encoders implement the same interfaces and drop in).
+// Command attndb is the CLI for the multi-pass database. Subcommands:
+//
+//	ingest   encode documents and store them (use -store qdrant to persist)
+//	search   query an already-ingested store (no re-encoding)
+//	query    one-shot: ingest then search in one process (good for -store memory)
+//
+// The store is selectable (memory | qdrant); encoders are stub (default) or onnx
+// (real GTE-ModernColBERT + gte-modernbert-base, needs a -tags onnx build).
 package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/kjn/attndb/internal/chunk"
 	"github.com/kjn/attndb/internal/core"
@@ -21,67 +28,198 @@ import (
 	"github.com/kjn/attndb/internal/store"
 )
 
+// sampleQueriesN is how many pseudo-queries calibration uses.
+const sampleQueriesN = 150
+
 func main() {
-	docsDir := flag.String("docs", "./sample_docs", "directory of .md documents to ingest")
-	k := flag.Int("k", 5, "number of results to show")
-	dim := flag.Int("dim", 64, "stub embedding dimension")
-	storeKind := flag.String("store", "memory", "vector store: memory | qdrant")
-	qaddr := flag.String("qdrant", "localhost:6334", "qdrant gRPC host:port (when -store=qdrant)")
-	filterFlag := flag.String("filter", "", "payload equality filter key=value (e.g. doc_id=policy.md)")
-	encoder := flag.String("encoder", "stub", "encoder: stub | onnx (onnx needs -tags onnx build)")
-	modelDir := flag.String("model", "models", "directory with model.onnx + tokenizer.json (onnx encoder)")
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: attndb [-store memory|qdrant] [-docs dir] [-k N] <query...>\n")
-		flag.PrintDefaults()
-	}
-	flag.Parse()
-	query := strings.Join(flag.Args(), " ")
-	if query == "" {
-		flag.Usage()
+	if len(os.Args) < 2 {
+		usage()
 		os.Exit(2)
 	}
-
-	mk, err := poolFactory(*storeKind, *qaddr)
+	args := os.Args[2:]
+	var err error
+	switch os.Args[1] {
+	case "ingest":
+		err = runIngest(args)
+	case "search":
+		err = runSearch(args)
+	case "query":
+		err = runQuery(args)
+	case "-h", "--help", "help":
+		usage()
+		return
+	default:
+		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", os.Args[1])
+		usage()
+		os.Exit(2)
+	}
 	if err != nil {
 		fatal("%v", err)
 	}
+}
 
-	multi, single, err := encoders(*encoder, *dim, *modelDir)
-	if err != nil {
-		fatal("%v", err)
+func usage() {
+	fmt.Fprint(os.Stderr, `usage: attndb <command> [flags] [query...]
+
+commands:
+  ingest   encode documents and store them (use -store qdrant to persist)
+  search   query an already-ingested store (no re-encoding)
+  query    one-shot: ingest then search in one process (good for -store memory)
+
+common flags: -store memory|qdrant  -qdrant host:port  -encoder stub|onnx
+              -model dir  -dim N  -docs dir
+search/query: -k N  -filter key=value
+`)
+}
+
+// common holds the flags shared by all subcommands.
+type common struct {
+	store, qaddr, encoder, model, docs, calib *string
+	dim                                       *int
+}
+
+func registerCommon(fs *flag.FlagSet) *common {
+	return &common{
+		store:   fs.String("store", "memory", "vector store: memory | qdrant"),
+		qaddr:   fs.String("qdrant", "localhost:6334", "qdrant gRPC host:port"),
+		encoder: fs.String("encoder", "stub", "encoder: stub | onnx"),
+		model:   fs.String("model", "models", "model directory (onnx encoder)"),
+		docs:    fs.String("docs", "./sample_docs", "documents directory"),
+		calib:   fs.String("calib", ".attndb-calibration.json", "calibration file (written by ingest, read by search)"),
+		dim:     fs.Int("dim", 64, "stub embedding dimension"),
 	}
+}
 
-	ctx := context.Background()
-	database, err := buildDB(multi, single, *encoder, mk)
+func (c *common) database() (*db.DB, error) {
+	mk, err := poolFactory(*c.store, *c.qaddr)
 	if err != nil {
-		fatal("build db: %v", err)
+		return nil, err
 	}
-
-	docs, err := loadDocs(*docsDir)
+	multi, single, err := encoders(*c.encoder, *c.dim, *c.model)
 	if err != nil {
-		fatal("load docs: %v", err)
+		return nil, err
+	}
+	return buildDB(multi, single, *c.encoder, mk)
+}
+
+func runIngest(args []string) error {
+	fs := flag.NewFlagSet("ingest", flag.ExitOnError)
+	c := registerCommon(fs)
+	fs.Parse(args)
+	if *c.store == "memory" {
+		return fmt.Errorf("`ingest -store memory` has no effect (in-memory store isn't persisted); use -store qdrant, or the `query` command")
+	}
+	docs, err := loadDocs(*c.docs)
+	if err != nil {
+		return err
 	}
 	if len(docs) == 0 {
-		fatal("no .md documents found in %s", *docsDir)
+		return fmt.Errorf("no .md documents found in %s", *c.docs)
 	}
-	if err := database.Ingest(ctx, docs); err != nil {
-		fatal("ingest: %v", err)
-	}
-	fmt.Printf("ingested %d document(s) from %s into %s store\n\n", len(docs), *docsDir, *storeKind)
-
-	q := core.Query{Text: query}
-	if *filterFlag != "" {
-		key, val, ok := strings.Cut(*filterFlag, "=")
-		if !ok {
-			fatal("invalid -filter %q (want key=value)", *filterFlag)
-		}
-		q.Filters = map[string]any{key: val}
-	}
-	results, err := database.Search(ctx, q, *k)
+	database, err := c.database()
 	if err != nil {
-		fatal("search: %v", err)
+		return err
 	}
-	printResults(query, results)
+	ctx := context.Background()
+	start := time.Now()
+	if err := database.Ingest(ctx, docs); err != nil {
+		return err
+	}
+	fmt.Printf("ingested %d document(s) from %s into %s in %s\n",
+		len(docs), *c.docs, *c.store, time.Since(start).Round(time.Millisecond))
+
+	// calibrate per-pass score ranges so non-matches score low at search time
+	cstart := time.Now()
+	samples := sampleQueries(docs, sampleQueriesN)
+	calib, err := database.Calibrate(ctx, samples)
+	if err != nil {
+		return err
+	}
+	if err := saveCalibration(*c.calib, *c.encoder, calib); err != nil {
+		return err
+	}
+	fmt.Printf("calibrated %d pass(es) from %d sample queries in %s -> %s\n",
+		len(calib), len(samples), time.Since(cstart).Round(time.Millisecond), *c.calib)
+	return nil
+}
+
+func runSearch(args []string) error {
+	fs := flag.NewFlagSet("search", flag.ExitOnError)
+	c := registerCommon(fs)
+	k := fs.Int("k", 5, "number of results to show")
+	minScore := fs.Float64("min", 0, "drop results below this score (relevance gate; needs calibration)")
+	filterFlag := fs.String("filter", "", "payload equality filter key=value")
+	fs.Parse(args)
+	query := strings.Join(fs.Args(), " ")
+	if query == "" {
+		return fmt.Errorf("search needs a query, e.g. attndb search -store qdrant \"...\"")
+	}
+	if *c.store == "memory" {
+		return fmt.Errorf("`search -store memory` finds nothing (the in-memory store isn't persisted across runs); ingest into -store qdrant first, or use `query`")
+	}
+	database, err := c.database()
+	if err != nil {
+		return err
+	}
+	calib, err := loadCalibration(*c.calib, *c.encoder)
+	if err != nil {
+		return err
+	}
+	if calib != nil {
+		database.SetCalibration(calib)
+	}
+	text, err := loadText(*c.docs) // doc text for snippets only — no encoding
+	if err != nil {
+		return err
+	}
+	results, err := database.Search(context.Background(), buildQuery(query, *filterFlag), *k)
+	if err != nil {
+		return err
+	}
+	printResults(query, gate(results, *minScore), text)
+	return nil
+}
+
+func runQuery(args []string) error {
+	fs := flag.NewFlagSet("query", flag.ExitOnError)
+	c := registerCommon(fs)
+	k := fs.Int("k", 5, "number of results to show")
+	minScore := fs.Float64("min", 0, "drop results below this score (relevance gate)")
+	filterFlag := fs.String("filter", "", "payload equality filter key=value")
+	fs.Parse(args)
+	query := strings.Join(fs.Args(), " ")
+	if query == "" {
+		return fmt.Errorf("query needs a query string")
+	}
+	docs, err := loadDocs(*c.docs)
+	if err != nil {
+		return err
+	}
+	if len(docs) == 0 {
+		return fmt.Errorf("no .md documents found in %s", *c.docs)
+	}
+	database, err := c.database()
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	if err := database.Ingest(ctx, docs); err != nil {
+		return err
+	}
+	// one-shot: calibrate in-process (not persisted)
+	if calib, err := database.Calibrate(ctx, sampleQueries(docs, sampleQueriesN)); err == nil {
+		database.SetCalibration(calib)
+	}
+	text := make(map[string]string, len(docs))
+	for _, d := range docs {
+		text[d.ID] = d.Text
+	}
+	results, err := database.Search(ctx, buildQuery(query, *filterFlag), *k)
+	if err != nil {
+		return err
+	}
+	printResults(query, gate(results, *minScore), text)
+	return nil
 }
 
 // poolFactory returns a function that creates a named Pool for the chosen store.
@@ -129,16 +267,93 @@ func buildDB(multi core.MultiVectorEncoder, single core.SingleVectorEncoder, enc
 	if err != nil {
 		return nil, err
 	}
-
 	passes := []pass.Pass{
 		// per-token core: section-aligned (kept under the model's 300-token doc cap)
 		pass.NewPerTokenPass("tok-section", chunk.BySection(200, 32), multi, tokPool),
 		// paragraph-level single-vector: diffuse-meaning deposits
 		pass.NewSingleVectorPass("para", chunk.ByParagraph(), single, paraPool),
-		// document-level single-vector: coarse topical / whole-doc gestalt prior
-		pass.NewSingleVectorPass("doc", chunk.WholeDoc(), single, docPool),
+		// document-level single-vector: a GENTLE whole-doc topical prior — kept
+		// low-weight so its flat deposit lifts the document without engulfing the
+		// localized peaks from the token/paragraph passes.
+		pass.NewSingleVectorPass("doc", chunk.WholeDoc(), single, docPool, pass.WithWeight(0.25)),
 	}
 	return db.New(passes), nil
+}
+
+func buildQuery(text, filter string) core.Query {
+	q := core.Query{Text: text}
+	if filter != "" {
+		if key, val, ok := strings.Cut(filter, "="); ok {
+			q.Filters = map[string]any{key: val}
+		}
+	}
+	return q
+}
+
+// sampleQueries builds short pseudo-queries (paragraph openings) for calibration.
+func sampleQueries(docs []core.Document, n int) []string {
+	var pool []string
+	for _, d := range docs {
+		for _, ch := range chunk.ByParagraph().Chunk(d) {
+			words := strings.Fields(ch.Text)
+			if len(words) < 4 {
+				continue
+			}
+			if len(words) > 12 {
+				words = words[:12]
+			}
+			pool = append(pool, strings.Join(words, " "))
+		}
+	}
+	r := rand.New(rand.NewSource(1)) // deterministic
+	r.Shuffle(len(pool), func(i, j int) { pool[i], pool[j] = pool[j], pool[i] })
+	if n > 0 && len(pool) > n {
+		pool = pool[:n]
+	}
+	return pool
+}
+
+// calibration files hold one entry per encoder.
+func loadCalibration(path, encoder string) (db.Calibration, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	cf := map[string]db.Calibration{}
+	if err := json.Unmarshal(b, &cf); err != nil {
+		return nil, err
+	}
+	return cf[encoder], nil
+}
+
+func saveCalibration(path, encoder string, c db.Calibration) error {
+	cf := map[string]db.Calibration{}
+	if b, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(b, &cf)
+	}
+	cf[encoder] = c
+	b, err := json.MarshalIndent(cf, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, b, 0o644)
+}
+
+// gate drops results scoring below min (the relevance floor).
+func gate(results []core.Result, min float64) []core.Result {
+	if min <= 0 {
+		return results
+	}
+	out := results[:0:0]
+	for _, r := range results {
+		if float64(r.Score) >= min {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 func loadDocs(dir string) ([]core.Document, error) {
@@ -164,6 +379,43 @@ func loadDocs(dir string) ([]core.Document, error) {
 	return docs, nil
 }
 
+// loadText reads document text for snippet rendering without building Documents.
+func loadText(dir string) (map[string]string, error) {
+	docs, err := loadDocs(dir)
+	if err != nil {
+		return nil, err
+	}
+	text := make(map[string]string, len(docs))
+	for _, d := range docs {
+		text[d.ID] = d.Text
+	}
+	return text, nil
+}
+
+func printResults(query string, results []core.Result, text map[string]string) {
+	fmt.Printf("query: %q\n", query)
+	if len(results) == 0 {
+		fmt.Println("(no results)")
+		return
+	}
+	for i, r := range results {
+		fmt.Printf("\n%d. [%.4f] %s  bytes %d–%d\n   %s\n",
+			i+1, r.Score, r.DocID, r.Span.Start, r.Span.End, snippet(text[r.DocID], r.Span))
+	}
+}
+
+func snippet(text string, span core.Span) string {
+	if span.Start < 0 || span.End > len(text) || span.Start >= span.End {
+		return ""
+	}
+	s := strings.Join(strings.Fields(text[span.Start:span.End]), " ")
+	const max = 240
+	if len(s) > max {
+		s = s[:max] + "…"
+	}
+	return s
+}
+
 func splitHostPort(addr string) (string, int, error) {
 	host, portStr, ok := strings.Cut(addr, ":")
 	if !ok {
@@ -174,19 +426,6 @@ func splitHostPort(addr string) (string, int, error) {
 		return "", 0, err
 	}
 	return host, port, nil
-}
-
-func printResults(query string, results []core.Result) {
-	fmt.Printf("query: %q\n", query)
-	if len(results) == 0 {
-		fmt.Println("(no results)")
-		return
-	}
-	for i, r := range results {
-		snippet := strings.Join(strings.Fields(r.Snippet), " ")
-		fmt.Printf("\n%d. [%.4f] %s  bytes %d–%d\n   %s\n",
-			i+1, r.Score, r.DocID, r.Span.Start, r.Span.End, snippet)
-	}
 }
 
 func fatal(format string, args ...any) {

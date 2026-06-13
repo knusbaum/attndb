@@ -67,10 +67,11 @@ type Candidate struct {
 	Source string // pass name that produced it
 }
 
-// Result is a final, ranked, localized search hit (a heatmap peak).
+// Result is a final, ranked, localized search hit (a heatmap peak). Snippet
+// rendering is the caller's job (slice the document by Span) — the DB does not
+// hold document text.
 type Result struct {
-	DocID   string
-	Span    Span
-	Score   float32
-	Snippet string
+	DocID string
+	Span  Span
+	Score float32
 }
