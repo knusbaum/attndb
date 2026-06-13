@@ -66,11 +66,12 @@ The default build uses deterministic *stub* encoders (lexical, for testing the
 pipeline). The real semantic encoders live behind the `onnx` build tag because
 they link native libraries (ONNX Runtime + HF tokenizers). One-time setup:
 
-1. **Export the models** (the only Python in the project — runs offline):
+1. **Export the models** (the only Python in the project — runs offline, in an
+   isolated pipenv env so it never touches your global interpreter):
    ```
-   pip install colbert-export onnxscript
-   python -c "from colbert_export import export_model; export_model('lightonai/GTE-ModernColBERT-v1', output_dir='models', quantize=True)"
-   python scripts/export_single.py     # gte-modernbert-base -> models/single/
+   pipenv install     # uses the Pipfile (colbert-export, onnxscript)
+   pipenv run python -c "from colbert_export import export_model; export_model('lightonai/GTE-ModernColBERT-v1', output_dir='models', quantize=True)"
+   pipenv run python scripts/export_single.py     # gte-modernbert-base -> models/single/
    ```
    This produces `models/` (per-token ColBERT) and `models/single/` (single-vector),
    each with `model.onnx`, `model.onnx.data`, and `tokenizer.json`.

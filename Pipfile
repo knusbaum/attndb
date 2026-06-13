@@ -1,0 +1,17 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+# Isolated environment for the one-time model exports (scripts/). Keeps the
+# heavy/conflicting ML tooling out of the global interpreter. The Go runtime
+# needs none of this. Usage:
+#   pipenv install
+#   pipenv run python -c "from colbert_export import export_model; export_model('lightonai/GTE-ModernColBERT-v1', output_dir='models', quantize=True)"
+#   pipenv run python scripts/export_single.py
+[packages]
+colbert-export = "*"  # pulls pylate, torch, transformers, sentence-transformers
+onnxscript = "*"      # torch.onnx export backend
+
+[requires]
+python_version = "3.11"

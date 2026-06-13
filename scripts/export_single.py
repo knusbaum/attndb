@@ -1,6 +1,8 @@
 """One-time export of a single-vector embedder to ONNX with pooling + L2
 normalization baked into the graph, so the Go side just runs it and reads one
-vector. Mirrors the ColBERT export. Usage: python scripts/export_single.py
+vector. Mirrors the ColBERT export.
+
+Run inside the isolated export env: `pipenv run python scripts/export_single.py`
 """
 
 import os
