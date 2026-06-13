@@ -60,13 +60,43 @@ go run ./cmd/attndb -store qdrant -k 3 "retry backoff when the service is unavai
 
 `-store memory` (default) needs no server and is what the tests use.
 
+## Real encoders (ONNX)
+
+The default build uses deterministic *stub* encoders (lexical, for testing the
+pipeline). The real semantic encoders live behind the `onnx` build tag because
+they link native libraries (ONNX Runtime + HF tokenizers). One-time setup:
+
+1. **Export the models** (the only Python in the project — runs offline):
+   ```
+   pip install colbert-export onnxscript
+   python -c "from colbert_export import export_model; export_model('lightonai/GTE-ModernColBERT-v1', output_dir='models', quantize=True)"
+   python scripts/export_single.py     # gte-modernbert-base -> models/single/
+   ```
+   This produces `models/` (per-token ColBERT) and `models/single/` (single-vector),
+   each with `model.onnx`, `model.onnx.data`, and `tokenizer.json`.
+
+2. **Fetch the tokenizer lib** into `libs/`:
+   ```
+   curl -sSL https://github.com/daulet/tokenizers/releases/download/v1.27.0/libtokenizers.linux-amd64.tar.gz | tar -xz -C libs
+   ```
+
+3. **Build and run** (ONNX Runtime is loaded at runtime from the path in
+   `internal/encode/onnx`, overridable via `ATTNDB_ORT_LIB`):
+   ```
+   CGO_LDFLAGS="-L$(pwd)/libs" go build -tags onnx -o attndb ./cmd/attndb
+   ./attndb -encoder onnx -store memory -k 3 "how long do we keep customer information"
+   ```
+
+`models/` (~1.4 GB) and `libs/` (~50 MB) are build artifacts and are not committed.
+
 ## Roadmap
 
 - [x] Pure-Go pass skeleton: chunkers, heatmap accumulator, DB, in-memory pool, stub encoders
 - [x] Unit tests (heat / chunk / vec / pass / db end-to-end)
 - [x] docker-compose for Qdrant
 - [x] Qdrant `Pool` (Go client; native multivector MaxSim + payload filtering)
-- [ ] Real ONNX encoder via `hugot` (GTE-ModernColBERT) + pooled embedder
+- [x] Real ONNX encoders: GTE-ModernColBERT (per-token) + gte-modernbert-base (single-vector)
 - [ ] AMD GPU acceleration spike: Vulkan (llama.cpp) vs ROCm (ONNX Runtime)
+- [ ] Encoder batching (currently one forward pass per text)
 - [ ] Token-level sub-span refinement over Qdrant (store offsets in payload, read vectors back)
 - [ ] Eval / bake-off harness sweeping pass configurations

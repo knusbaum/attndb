@@ -2,7 +2,11 @@ module github.com/kjn/attndb
 
 go 1.26.2
 
-require github.com/qdrant/go-client v1.18.2
+require (
+	github.com/daulet/tokenizers v1.27.0
+	github.com/qdrant/go-client v1.18.2
+	github.com/yalue/onnxruntime_go v1.17.0
+)
 
 require (
 	golang.org/x/net v0.53.0 // indirect

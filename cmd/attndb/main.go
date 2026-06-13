@@ -28,6 +28,8 @@ func main() {
 	storeKind := flag.String("store", "memory", "vector store: memory | qdrant")
 	qaddr := flag.String("qdrant", "localhost:6334", "qdrant gRPC host:port (when -store=qdrant)")
 	filterFlag := flag.String("filter", "", "payload equality filter key=value (e.g. doc_id=policy.md)")
+	encoder := flag.String("encoder", "stub", "encoder: stub | onnx (onnx needs -tags onnx build)")
+	modelDir := flag.String("model", "models", "directory with model.onnx + tokenizer.json (onnx encoder)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: attndb [-store memory|qdrant] [-docs dir] [-k N] <query...>\n")
 		flag.PrintDefaults()
@@ -44,8 +46,13 @@ func main() {
 		fatal("%v", err)
 	}
 
+	multi, single, err := encoders(*encoder, *dim, *modelDir)
+	if err != nil {
+		fatal("%v", err)
+	}
+
 	ctx := context.Background()
-	database, err := buildDB(*dim, mk)
+	database, err := buildDB(multi, single, *encoder, mk)
 	if err != nil {
 		fatal("build db: %v", err)
 	}
@@ -93,26 +100,39 @@ func poolFactory(kind, qaddr string) (func(name string) (store.Pool, error), err
 	}
 }
 
-func buildDB(dim int, mk func(string) (store.Pool, error)) (*db.DB, error) {
-	single := encode.NewStubSingle(dim)
-	multi := encode.NewStubMulti(dim)
+// encoders selects the encoder pair. onnxEncoders is provided by a build-tagged
+// file (real under -tags onnx, an error otherwise).
+func encoders(kind string, dim int, modelDir string) (core.MultiVectorEncoder, core.SingleVectorEncoder, error) {
+	switch kind {
+	case "stub":
+		return encode.NewStubMulti(dim), encode.NewStubSingle(dim), nil
+	case "onnx":
+		return onnxEncoders(modelDir)
+	default:
+		return nil, nil, fmt.Errorf("unknown -encoder %q (want stub|onnx)", kind)
+	}
+}
 
-	tokPool, err := mk("attndb_tok_section")
+func buildDB(multi core.MultiVectorEncoder, single core.SingleVectorEncoder, encKind string, mk func(string) (store.Pool, error)) (*db.DB, error) {
+	// collection names are encoder-scoped so different encoders (and dims) don't
+	// collide in the same store
+	suffix := "_" + encKind
+	tokPool, err := mk("attndb_tok_section" + suffix)
 	if err != nil {
 		return nil, err
 	}
-	paraPool, err := mk("attndb_para")
+	paraPool, err := mk("attndb_para" + suffix)
 	if err != nil {
 		return nil, err
 	}
-	docPool, err := mk("attndb_doc")
+	docPool, err := mk("attndb_doc" + suffix)
 	if err != nil {
 		return nil, err
 	}
 
 	passes := []pass.Pass{
-		// per-token core: section-aligned ~1K window; deposits MaxSim matches
-		pass.NewPerTokenPass("tok-section", chunk.BySection(1024, 128), multi, tokPool),
+		// per-token core: section-aligned (kept under the model's 300-token doc cap)
+		pass.NewPerTokenPass("tok-section", chunk.BySection(200, 32), multi, tokPool),
 		// paragraph-level single-vector: diffuse-meaning deposits
 		pass.NewSingleVectorPass("para", chunk.ByParagraph(), single, paraPool),
 		// document-level single-vector: coarse topical / whole-doc gestalt prior
