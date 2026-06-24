@@ -170,6 +170,15 @@ func (p *PerTokenPass) Deposits(ctx context.Context, q core.Query, k int) ([]cor
 	if err != nil {
 		return nil, err
 	}
+	// MaxSim sums one best-match similarity per query token, so the raw score
+	// scales with query length. Divide by the query token count to get the mean
+	// per-token similarity — a length-invariant score, so calibration learned
+	// from (long) pseudo-queries transfers to (short) real queries instead of
+	// flooring every candidate to zero.
+	norm := float32(1)
+	if n := len(qt.Vecs); n > 0 {
+		norm = float32(n)
+	}
 	out := make([]core.Candidate, 0, len(hits))
 	for _, h := range hits {
 		span := h.Rec.Span
@@ -178,7 +187,7 @@ func (p *PerTokenPass) Deposits(ctx context.Context, q core.Query, k int) ([]cor
 				span = s // refine to the best-matching sub-span
 			}
 		}
-		out = append(out, core.Candidate{DocID: h.Rec.DocID, Span: span, Score: h.Score, Source: p.name})
+		out = append(out, core.Candidate{DocID: h.Rec.DocID, Span: span, Score: h.Score / norm, Source: p.name})
 	}
 	return out, nil
 }

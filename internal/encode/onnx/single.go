@@ -19,18 +19,24 @@ const singleDim = 768
 // max is 8192; whole-document chunks are truncated to a coarse gestalt).
 const maxSingleLen = 8192
 
+// coreMlSingleLen is the fixed sequence length used in CoreML mode. CoreML
+// requires a static graph shape; 512 covers typical paragraph/section chunks
+// while keeping the compiled model tractable.
+const coreMlSingleLen = 512
+
 // SingleVector is a dedicated single-vector encoder (core.SingleVectorEncoder)
 // over a sentence-transformers model exported with pooling + L2 normalization
 // baked into the ONNX graph, so the output is already one normalized vector.
 type SingleVector struct {
-	tk   *tokenizers.Tokenizer
-	sess *ort.DynamicAdvancedSession
-	mu   sync.Mutex
+	tk     *tokenizers.Tokenizer
+	sess   *ort.DynamicAdvancedSession
+	padded bool // pad to coreMlSingleLen for CoreML static shape
+	mu     sync.Mutex
 }
 
 // NewSingleVector loads the model and tokenizer from modelDir (expects model.onnx
-// and tokenizer.json).
-func NewSingleVector(modelDir string) (*SingleVector, error) {
+// and tokenizer.json). provider is "cpu" or "coreml".
+func NewSingleVector(modelDir, provider string) (*SingleVector, error) {
 	if err := ensureEnv(); err != nil {
 		return nil, fmt.Errorf("onnx env: %w", err)
 	}
@@ -38,13 +44,19 @@ func NewSingleVector(modelDir string) (*SingleVector, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load tokenizer: %w", err)
 	}
+	opts, err := buildSessionOptions(provider)
+	if err != nil {
+		tk.Close()
+		return nil, err
+	}
+	defer opts.Destroy()
 	sess, err := ort.NewDynamicAdvancedSession(modelDir+"/model.onnx",
-		[]string{"input_ids", "attention_mask"}, []string{"sentence_embedding"}, nil)
+		[]string{"input_ids", "attention_mask"}, []string{"sentence_embedding"}, opts)
 	if err != nil {
 		tk.Close()
 		return nil, fmt.Errorf("load model: %w", err)
 	}
-	return &SingleVector{tk: tk, sess: sess}, nil
+	return &SingleVector{tk: tk, sess: sess, padded: provider == "coreml"}, nil
 }
 
 func (s *SingleVector) Dim() int { return singleDim }
@@ -76,18 +88,31 @@ func (s *SingleVector) encode(text string) ([]float32, error) {
 
 	// addSpecialTokens=true: the model expects [CLS] … [SEP]. No ColBERT markers.
 	enc := s.tk.EncodeWithOptions(text, true)
-	n := len(enc.IDs)
-	if n > maxSingleLen {
-		n = maxSingleLen
+	seqCap := maxSingleLen
+	if s.padded {
+		seqCap = coreMlSingleLen
 	}
-	ids := make([]int64, n)
-	mask := make([]int64, n)
+	n := len(enc.IDs)
+	if n > seqCap {
+		n = seqCap
+	}
+
+	// For CoreML we pad to a fixed length so the graph compiles as a static
+	// shape. Without this, CoreML can't partition the transformer and silently
+	// falls back to CPU for all ops.
+	allocLen := n
+	if s.padded && allocLen < coreMlSingleLen {
+		allocLen = coreMlSingleLen
+	}
+	ids := make([]int64, allocLen)
+	mask := make([]int64, allocLen)
 	for i := 0; i < n; i++ {
 		ids[i] = int64(enc.IDs[i])
 		mask[i] = 1
 	}
+	// ids[n:] and mask[n:] are already zero (pad token, masked out)
 
-	shape := ort.NewShape(1, int64(n))
+	shape := ort.NewShape(1, int64(allocLen))
 	idT, err := ort.NewTensor(shape, ids)
 	if err != nil {
 		return nil, err

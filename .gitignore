@@ -1,0 +1,21 @@
+# Compiled binary
+/attndb
+
+# Native libraries (built/downloaded locally; see README)
+/libs/
+
+# ONNX models + tokenizer (exported locally; large, regenerable)
+/models/
+
+# Local Qdrant storage
+/qdrant_storage/
+
+# Generated calibration (produced by `ingest`, tied to a specific corpus)
+/.attndb-calibration.json
+
+# Local document corpora — may contain sensitive/internal material; never commit
+/corpus/
+/corpus_milou/
+
+# Agent session scratch (worktrees, eval scripts)
+/.claude/

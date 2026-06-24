@@ -40,8 +40,10 @@ const (
 // punctuation is ColBERT's document skiplist (config skiplist_words).
 const punctuation = `!"#$%&'()*+,-./:;<=>?@[\]^_` + "`" + `{|}~`
 
-// defaultLibPath is the Python-bundled ONNX Runtime; override with ATTNDB_ORT_LIB.
-const defaultLibPath = "/home/kjn/.pyenv/versions/3.11.13/lib/python3.11/site-packages/onnxruntime/capi/libonnxruntime.so.1.20.1"
+// defaultLibPath is the ONNX Runtime shared library shipped alongside the
+// native libs in ./libs (resolved relative to the working dir); override with
+// ATTNDB_ORT_LIB. The Makefile sets ATTNDB_ORT_LIB explicitly.
+const defaultLibPath = "libs/libonnxruntime.1.27.0.dylib"
 
 var initOnce sync.Once
 var initErr error
@@ -58,17 +60,48 @@ func ensureEnv() error {
 	return initErr
 }
 
+// buildSessionOptions returns a SessionOptions configured for the given
+// execution provider. For "coreml", it appends the CoreML EP targeting the
+// Metal GPU and enables verbose session logging so node-to-EP assignments are
+// visible on stderr. It errors loud if the CoreML EP is not available in the
+// loaded dylib — callers must not silently fall back to CPU.
+// The caller is responsible for calling opts.Destroy() after the session is created.
+func buildSessionOptions(provider string) (*ort.SessionOptions, error) {
+	opts, err := ort.NewSessionOptions()
+	if err != nil {
+		return nil, fmt.Errorf("session options: %w", err)
+	}
+	if provider == "coreml" {
+		// Verbose logging exposes which nodes ORT assigns to CoreMLExecutionProvider
+		// vs CPUExecutionProvider. Watch stderr for "Node ... assigned to ...".
+		if err := opts.SetLogSeverityLevel(ort.LoggingLevelVerbose); err != nil {
+			opts.Destroy()
+			return nil, fmt.Errorf("set log level: %w", err)
+		}
+		// CPUAndGPU = Metal GPU + CPU fallback. Use "All" to also include the ANE.
+		if err := opts.AppendExecutionProviderCoreMLV2(map[string]string{
+			"MLComputeUnits": "CPUAndGPU",
+		}); err != nil {
+			opts.Destroy()
+			return nil, fmt.Errorf("CoreML EP unavailable (is the dylib built with CoreML support?): %w", err)
+		}
+	}
+	return opts, nil
+}
+
 // ColBERT is a per-token (MultiVectorEncoder) over the exported model.
 type ColBERT struct {
 	tk       *tokenizers.Tokenizer
 	sess     *ort.DynamicAdvancedSession
 	skiplist map[uint32]bool
-	mu       sync.Mutex // serialize tokenizer + session use
+	padded   bool // pad inputs to fixed shapes (queryLen/docLen) for CoreML static graph
+	mu       sync.Mutex
 }
 
 // NewColBERT loads the model and tokenizer from modelDir (expects model.onnx and
-// tokenizer.json).
-func NewColBERT(modelDir string) (*ColBERT, error) {
+// tokenizer.json). provider is "cpu" or "coreml"; "coreml" enables the CoreML
+// execution provider for Metal GPU acceleration.
+func NewColBERT(modelDir, provider string) (*ColBERT, error) {
 	if err := ensureEnv(); err != nil {
 		return nil, fmt.Errorf("onnx env: %w", err)
 	}
@@ -76,13 +109,24 @@ func NewColBERT(modelDir string) (*ColBERT, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load tokenizer: %w", err)
 	}
+	opts, err := buildSessionOptions(provider)
+	if err != nil {
+		tk.Close()
+		return nil, err
+	}
+	defer opts.Destroy()
 	sess, err := ort.NewDynamicAdvancedSession(modelDir+"/model.onnx",
-		[]string{"input_ids", "attention_mask"}, []string{"output"}, nil)
+		[]string{"input_ids", "attention_mask"}, []string{"output"}, opts)
 	if err != nil {
 		tk.Close()
 		return nil, fmt.Errorf("load model: %w", err)
 	}
-	return &ColBERT{tk: tk, sess: sess, skiplist: buildSkiplist(tk)}, nil
+	return &ColBERT{
+		tk:       tk,
+		sess:     sess,
+		skiplist: buildSkiplist(tk),
+		padded:   provider == "coreml",
+	}, nil
 }
 
 func (c *ColBERT) Dim() int { return dim }
@@ -137,7 +181,18 @@ func (c *ColBERT) encode(text string, isDoc bool) (core.TokenVecs, error) {
 		mask[i] = 1
 	}
 
-	data, err := c.run(ids, mask)
+	// For CoreML we pad to the fixed model caps so the graph compiles as a
+	// static shape. Without this, CoreML can't partition the transformer
+	// graph and silently falls back to CPU for all ops.
+	fixedLen := 0
+	if c.padded {
+		if isDoc {
+			fixedLen = docLen
+		} else {
+			fixedLen = queryLen
+		}
+	}
+	data, err := c.run(ids, mask, fixedLen)
 	if err != nil {
 		return core.TokenVecs{}, err
 	}
@@ -160,7 +215,14 @@ func (c *ColBERT) encode(text string, isDoc bool) (core.TokenVecs, error) {
 }
 
 // run executes the session and returns the flattened [seq*dim] output.
-func (c *ColBERT) run(ids, mask []int64) ([]float32, error) {
+// If fixedLen > 0 the inputs are zero-padded (mask stays 0) to that length,
+// giving CoreML a static shape it can compile.
+func (c *ColBERT) run(ids, mask []int64, fixedLen int) ([]float32, error) {
+	if fixedLen > len(ids) {
+		pad := make([]int64, fixedLen-len(ids))
+		ids = append(ids, pad...)  // pad token id 0 (ignored by attention)
+		mask = append(mask, pad...) // 0 = masked out
+	}
 	shape := ort.NewShape(1, int64(len(ids)))
 	idT, err := ort.NewTensor(shape, ids)
 	if err != nil {

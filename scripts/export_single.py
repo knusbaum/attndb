@@ -27,7 +27,12 @@ class Wrap(nn.Module):
 
 
 def main():
-    st = SentenceTransformer(NAME)
+    # Force CPU: on Apple Silicon PyTorch defaults to MPS, which causes device
+    # conflicts in torch.onnx.export's FakeTensor propagation.
+    st = SentenceTransformer(NAME, device="cpu")
+    # Cast to float32: the HuggingFace model is stored in float16 but the Go
+    # runtime expects float32 tensors.
+    st = st.float()
     st.eval()
     os.makedirs(OUT, exist_ok=True)
 
@@ -42,7 +47,7 @@ def main():
         dynamic_axes={
             "input_ids": {0: "batch", 1: "seq"},
             "attention_mask": {0: "batch", 1: "seq"},
-            "sentence_embedding": {0: "batch"},
+            "sentence_embedding": {0: "batch", 1: "dim"},
         },
         opset_version=20,
     )

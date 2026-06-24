@@ -90,9 +90,14 @@ they link native libraries (ONNX Runtime + HF tokenizers). One-time setup:
    each with `model.onnx`, `model.onnx.data`, and `tokenizer.json`.
 
 2. **Fetch the tokenizer lib** into `libs/`:
-   ```
-   curl -sSL https://github.com/daulet/tokenizers/releases/download/v1.27.0/libtokenizers.linux-amd64.tar.gz | tar -xz -C libs
-   ```
+   - **Linux (amd64)**:
+     ```
+     curl -sSL https://github.com/daulet/tokenizers/releases/download/v1.27.0/libtokenizers.linux-amd64.tar.gz | tar -xz -C libs
+     ```
+   - **macOS (Apple Silicon)**:
+     ```
+     curl -sSL https://github.com/daulet/tokenizers/releases/download/v1.27.0/libtokenizers.darwin-arm64.tar.gz | tar -xz -C libs
+     ```
 
 3. **Build and run** (ONNX Runtime is loaded at runtime from the path in
    `internal/encode/onnx`, overridable via `ATTNDB_ORT_LIB`):
@@ -103,6 +108,35 @@ they link native libraries (ONNX Runtime + HF tokenizers). One-time setup:
 
 `models/` (~1.4 GB) and `libs/` (~50 MB) are build artifacts and are not committed.
 
+## Metal/CoreML acceleration (macOS)
+
+The ONNX Runtime CoreML Execution Provider runs ops on the Metal GPU. It is
+built into the standard macOS ORT dylib (from pip or Homebrew).
+
+```
+# point at the ORT dylib; pip-installed ORT is the easiest source
+export ATTNDB_ORT_LIB=$(python3 -c \
+  "import onnxruntime, pathlib; \
+   print(next(pathlib.Path(onnxruntime.__file__).parent.glob('capi/libonnxruntime*.dylib')))")
+
+# one-shot ingest + search on the Metal GPU
+./attndb query -encoder onnx -provider coreml -k 3 "retry backoff when the service is unavailable"
+
+# benchmark: compare CPU vs CoreML on the same corpus
+time ./attndb query -encoder onnx -provider cpu    -k 3 "..."
+time ./attndb query -encoder onnx -provider coreml -k 3 "..."
+```
+
+`-provider coreml` enables `MLComputeUnits=CPUAndGPU` (Metal GPU + CPU fallback
+for any ops CoreML can't handle). It also enables ORT verbose logging so node-to-EP
+assignments appear on stderr — look for `Node ... assigned to CoreMLExecutionProvider`
+to confirm ops actually ran on Metal. If CoreML is not compiled into the dylib the
+flag errors loud rather than silently falling back.
+
+Inputs are padded to fixed shapes (ColBERT: 48/300 tokens; single-vector: 512 tokens)
+so CoreML can compile a static graph. Without static shapes the CoreML EP falls back
+to CPU for transformer ops.
+
 ## Roadmap
 
 - [x] Pure-Go pass skeleton: chunkers, heatmap accumulator, DB, in-memory pool, stub encoders
@@ -110,7 +144,7 @@ they link native libraries (ONNX Runtime + HF tokenizers). One-time setup:
 - [x] docker-compose for Qdrant
 - [x] Qdrant `Pool` (Go client; native multivector MaxSim + payload filtering)
 - [x] Real ONNX encoders: GTE-ModernColBERT (per-token) + gte-modernbert-base (single-vector)
-- [ ] AMD GPU acceleration spike: Vulkan (llama.cpp) vs ROCm (ONNX Runtime)
+- [x] Mac/Metal acceleration spike: CoreML Execution Provider via ONNX Runtime (`-provider coreml`)
 - [ ] Encoder batching (currently one forward pass per text)
 - [ ] Token-level sub-span refinement over Qdrant (store offsets in payload, read vectors back)
 - [ ] Eval / bake-off harness sweeping pass configurations

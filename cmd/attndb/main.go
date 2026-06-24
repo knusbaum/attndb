@@ -16,6 +16,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -67,26 +68,35 @@ commands:
   query    one-shot: ingest then search in one process (good for -store memory)
 
 common flags: -store memory|qdrant  -qdrant host:port  -encoder stub|onnx
-              -model dir  -dim N  -docs dir
+              -provider cpu|coreml  -model dir  -dim N  -docs dir
 search/query: -k N  -filter key=value
 `)
 }
 
 // common holds the flags shared by all subcommands.
 type common struct {
-	store, qaddr, encoder, model, docs, calib *string
-	dim                                       *int
+	store, qaddr, encoder, provider, model, docs, calib *string
+	dim                                                 *int
+	// retrieval tuning knobs (exposed for measurement/A-B; see buildDB)
+	recallK                 *int
+	peak, wTok, wPara, wDoc *float64
 }
 
 func registerCommon(fs *flag.FlagSet) *common {
 	return &common{
-		store:   fs.String("store", "memory", "vector store: memory | qdrant"),
-		qaddr:   fs.String("qdrant", "localhost:6334", "qdrant gRPC host:port"),
-		encoder: fs.String("encoder", "stub", "encoder: stub | onnx"),
-		model:   fs.String("model", "models", "model directory (onnx encoder)"),
-		docs:    fs.String("docs", "./sample_docs", "documents directory"),
-		calib:   fs.String("calib", ".attndb-calibration.json", "calibration file (written by ingest, read by search)"),
-		dim:     fs.Int("dim", 64, "stub embedding dimension"),
+		store:    fs.String("store", "memory", "vector store: memory | qdrant"),
+		qaddr:    fs.String("qdrant", "localhost:6334", "qdrant gRPC host:port"),
+		encoder:  fs.String("encoder", "stub", "encoder: stub | onnx"),
+		provider: fs.String("provider", "cpu", "onnx execution provider: cpu | coreml (Mac/Metal)"),
+		model:    fs.String("model", "models", "model directory (onnx encoder)"),
+		docs:     fs.String("docs", "./sample_docs", "documents directory"),
+		calib:    fs.String("calib", ".attndb-calibration.json", "calibration file (written by ingest, read by search)"),
+		dim:      fs.Int("dim", 64, "stub embedding dimension"),
+		recallK:  fs.Int("recallK", 50, "candidates each pass contributes before fusion"),
+		peak:     fs.Float64("peak", 0.5, "peak-region growth fraction (heat accumulation)"),
+		wTok:     fs.Float64("w-tok", 1, "weight of the per-token (ColBERT) pass"),
+		wPara:    fs.Float64("w-para", 1, "weight of the paragraph single-vector pass"),
+		wDoc:     fs.Float64("w-doc", 0.25, "weight of the whole-doc single-vector pass"),
 	}
 }
 
@@ -95,11 +105,14 @@ func (c *common) database() (*db.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	multi, single, err := encoders(*c.encoder, *c.dim, *c.model)
+	multi, single, err := encoders(*c.encoder, *c.dim, *c.model, *c.provider)
 	if err != nil {
 		return nil, err
 	}
-	return buildDB(multi, single, *c.encoder, mk)
+	return buildDB(multi, single, *c.encoder, mk, tuning{
+		recallK: *c.recallK, peak: *c.peak,
+		wTok: *c.wTok, wPara: *c.wPara, wDoc: *c.wDoc,
+	})
 }
 
 func runIngest(args []string) error {
@@ -131,7 +144,7 @@ func runIngest(args []string) error {
 	// calibrate per-pass score ranges so non-matches score low at search time
 	cstart := time.Now()
 	samples := sampleQueries(docs, sampleQueriesN)
-	calib, err := database.Calibrate(ctx, samples)
+	calib, err := database.Calibrate(ctx, samples, noiseQueries())
 	if err != nil {
 		return err
 	}
@@ -149,6 +162,7 @@ func runSearch(args []string) error {
 	k := fs.Int("k", 5, "number of results to show")
 	minScore := fs.Float64("min", 0, "drop results below this score (relevance gate; needs calibration)")
 	filterFlag := fs.String("filter", "", "payload equality filter key=value")
+	explain := fs.Bool("explain", false, "print each pass's recalled candidates and scores")
 	fs.Parse(args)
 	query := strings.Join(fs.Args(), " ")
 	if query == "" {
@@ -172,6 +186,14 @@ func runSearch(args []string) error {
 	if err != nil {
 		return err
 	}
+	if *explain {
+		exp, err := database.Explain(context.Background(), buildQuery(query, *filterFlag), *k)
+		if err != nil {
+			return err
+		}
+		printExplain(query, exp)
+		return nil
+	}
 	results, err := database.Search(context.Background(), buildQuery(query, *filterFlag), *k)
 	if err != nil {
 		return err
@@ -186,6 +208,7 @@ func runQuery(args []string) error {
 	k := fs.Int("k", 5, "number of results to show")
 	minScore := fs.Float64("min", 0, "drop results below this score (relevance gate)")
 	filterFlag := fs.String("filter", "", "payload equality filter key=value")
+	explain := fs.Bool("explain", false, "print each pass's recalled candidates and scores")
 	fs.Parse(args)
 	query := strings.Join(fs.Args(), " ")
 	if query == "" {
@@ -207,12 +230,20 @@ func runQuery(args []string) error {
 		return err
 	}
 	// one-shot: calibrate in-process (not persisted)
-	if calib, err := database.Calibrate(ctx, sampleQueries(docs, sampleQueriesN)); err == nil {
+	if calib, err := database.Calibrate(ctx, sampleQueries(docs, sampleQueriesN), noiseQueries()); err == nil {
 		database.SetCalibration(calib)
 	}
 	text := make(map[string]string, len(docs))
 	for _, d := range docs {
 		text[d.ID] = d.Text
+	}
+	if *explain {
+		exp, err := database.Explain(ctx, buildQuery(query, *filterFlag), *k)
+		if err != nil {
+			return err
+		}
+		printExplain(query, exp)
+		return nil
 	}
 	results, err := database.Search(ctx, buildQuery(query, *filterFlag), *k)
 	if err != nil {
@@ -240,18 +271,28 @@ func poolFactory(kind, qaddr string) (func(name string) (store.Pool, error), err
 
 // encoders selects the encoder pair. onnxEncoders is provided by a build-tagged
 // file (real under -tags onnx, an error otherwise).
-func encoders(kind string, dim int, modelDir string) (core.MultiVectorEncoder, core.SingleVectorEncoder, error) {
+func encoders(kind string, dim int, modelDir, provider string) (core.MultiVectorEncoder, core.SingleVectorEncoder, error) {
 	switch kind {
 	case "stub":
+		if provider != "cpu" {
+			return nil, nil, fmt.Errorf("-provider %q requires -encoder onnx", provider)
+		}
 		return encode.NewStubMulti(dim), encode.NewStubSingle(dim), nil
 	case "onnx":
-		return onnxEncoders(modelDir)
+		return onnxEncoders(modelDir, provider)
 	default:
 		return nil, nil, fmt.Errorf("unknown -encoder %q (want stub|onnx)", kind)
 	}
 }
 
-func buildDB(multi core.MultiVectorEncoder, single core.SingleVectorEncoder, encKind string, mk func(string) (store.Pool, error)) (*db.DB, error) {
+// tuning carries the retrieval knobs exposed on the CLI for measurement/A-B.
+type tuning struct {
+	recallK           int
+	peak              float64
+	wTok, wPara, wDoc float64
+}
+
+func buildDB(multi core.MultiVectorEncoder, single core.SingleVectorEncoder, encKind string, mk func(string) (store.Pool, error), t tuning) (*db.DB, error) {
 	// collection names are encoder-scoped so different encoders (and dims) don't
 	// collide in the same store
 	suffix := "_" + encKind
@@ -269,15 +310,15 @@ func buildDB(multi core.MultiVectorEncoder, single core.SingleVectorEncoder, enc
 	}
 	passes := []pass.Pass{
 		// per-token core: section-aligned (kept under the model's 300-token doc cap)
-		pass.NewPerTokenPass("tok-section", chunk.BySection(200, 32), multi, tokPool),
+		pass.NewPerTokenPass("tok-section", chunk.BySection(200, 32), multi, tokPool, pass.WithWeight(t.wTok)),
 		// paragraph-level single-vector: diffuse-meaning deposits
-		pass.NewSingleVectorPass("para", chunk.ByParagraph(), single, paraPool),
+		pass.NewSingleVectorPass("para", chunk.ByParagraph(), single, paraPool, pass.WithWeight(t.wPara)),
 		// document-level single-vector: a GENTLE whole-doc topical prior — kept
 		// low-weight so its flat deposit lifts the document without engulfing the
 		// localized peaks from the token/paragraph passes.
-		pass.NewSingleVectorPass("doc", chunk.WholeDoc(), single, docPool, pass.WithWeight(0.25)),
+		pass.NewSingleVectorPass("doc", chunk.WholeDoc(), single, docPool, pass.WithWeight(t.wDoc)),
 	}
-	return db.New(passes), nil
+	return db.New(passes, db.WithRecallK(t.recallK), db.WithPeakFraction(t.peak)), nil
 }
 
 func buildQuery(text, filter string) core.Query {
@@ -311,6 +352,41 @@ func sampleQueries(docs []core.Document, n int) []string {
 		pool = pool[:n]
 	}
 	return pool
+}
+
+// noiseQueries are out-of-domain, question-shaped queries used as calibration
+// negatives: they share the form of real queries but have no relation to any
+// corpus, so the best score they reach marks each pass's noise ceiling (LO).
+// Kept content-diverse and corpus-agnostic so the floor reflects "unrelated
+// query" rather than "rare in-corpus term".
+func noiseQueries() []string {
+	return []string{
+		"how do you bake sourdough bread at high altitude",
+		"what is the migration pattern of monarch butterflies",
+		"best way to tune a six string acoustic guitar",
+		"history of the roman aqueduct construction techniques",
+		"why do cats purr when they are content",
+		"recipe for a classic neapolitan margherita pizza",
+		"how far is the andromeda galaxy from earth",
+		"rules for scoring a game of cricket",
+		"how to prune tomato plants for better yield",
+		"what causes the northern lights to appear",
+		"techniques for watercolor landscape painting",
+		"how do bees communicate the location of flowers",
+		"what year did the first transcontinental railroad open",
+		"how to brew a proper cup of green tea",
+		"the life cycle of a pacific salmon",
+		"how do submarines control their buoyancy underwater",
+		"famous composers of the baroque musical period",
+		"how to change a flat tire on a bicycle",
+		"what makes a volcano erupt explosively",
+		"steps for folding an origami paper crane",
+		"how do tides relate to the phases of the moon",
+		"traditional ingredients in a moroccan tagine",
+		"why is the sky blue during the day",
+		"how to train a puppy to sit and stay",
+		"the difference between stalactites and stalagmites",
+	}
 }
 
 // calibration files hold one entry per encoder.
@@ -401,6 +477,40 @@ func printResults(query string, results []core.Result, text map[string]string) {
 	for i, r := range results {
 		fmt.Printf("\n%d. [%.4f] %s  bytes %d–%d\n   %s\n",
 			i+1, r.Score, r.DocID, r.Span.Start, r.Span.End, snippet(text[r.DocID], r.Span))
+	}
+}
+
+// printExplain dumps each pass's recalled candidates (top by contribution) with
+// raw/normalized/weighted scores, then the fused peaks — so you can see where a
+// document ranks in each lane and whether it's a recall, scoring, or fusion gap.
+func printExplain(query string, exp *db.Explanation) {
+	fmt.Printf("query: %q\n", query)
+	const topPerPass = 10
+	for _, p := range exp.Passes {
+		cands := append([]db.ExplainCand(nil), p.Cands...)
+		sort.SliceStable(cands, func(i, j int) bool { return cands[i].Contribution > cands[j].Contribution })
+		fmt.Printf("\n== pass %q (weight %.2f, %d candidates) ==\n", p.Pass, p.Weight, len(p.Cands))
+		if len(cands) == 0 {
+			fmt.Println("   (no candidates recalled)")
+			continue
+		}
+		fmt.Printf("   %-32s %8s %6s %6s\n", "doc  bytes", "raw", "norm", "contrib")
+		for i, c := range cands {
+			if i >= topPerPass {
+				fmt.Printf("   … %d more\n", len(cands)-topPerPass)
+				break
+			}
+			loc := fmt.Sprintf("%s %d–%d", c.DocID, c.Span.Start, c.Span.End)
+			fmt.Printf("   %-32s %8.4f %6.3f %6.3f\n", loc, c.Raw, c.Norm, c.Contribution)
+		}
+	}
+	fmt.Printf("\n== fused peaks ==\n")
+	if len(exp.Peaks) == 0 {
+		fmt.Println("   (none)")
+		return
+	}
+	for i, r := range exp.Peaks {
+		fmt.Printf("   %d. [%.4f] %s  bytes %d–%d\n", i+1, r.Score, r.DocID, r.Span.Start, r.Span.End)
 	}
 }
 
