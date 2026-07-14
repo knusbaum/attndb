@@ -167,34 +167,40 @@ indexes in one Qdrant (e.g. a vault vs. the sample corpus).
 
 ## Guiding an LLM to use the vault
 
-The `search_vault` tool carries enough description to be usable by any MCP client.
-Two optional layers make an LLM reach for it at the right moments:
+The tool descriptions are usable by any MCP client. Two optional Claude Code
+layers make an LLM reach for the vault at the right moments — to *reuse* prior
+work and to *grow* the corpus with what it learns:
 
-**1. The `attndb-search` skill (Claude Code).** `skills/attndb-search/SKILL.md`
-is a Claude Code skill that gets auto-surfaced when a question might be covered by
-the vault. It encodes when to search, how to phrase queries, how to read the
-calibrated scores ("a low top score means no confident match"), and to cite the
-source path. Install it by copying or symlinking it into your skills dir:
+**1. Skills (Claude Code).** Drop these into your skills dir; they auto-surface by
+description:
 
 ```
-ln -s "$PWD/skills/attndb-search" ~/.claude/skills/attndb-search
+ln -s "$PWD/skills/attndb-search"           ~/.claude/skills/attndb-search
+ln -s "$PWD/skills/attndb-research-capture" ~/.claude/skills/attndb-research-capture
 ```
+- `attndb-search` — query technique: when to search, entity-rich phrasing,
+  reading calibrated scores, citing `path:line`.
+- `attndb-research-capture` — the ratchet: search the vault before researching,
+  and after substantial research write a durable note back into it (dedup via
+  `read_doc`/`edit_doc`, `Research/` placement, provenance stamp, notify-after).
 
-**2. A search-first directive.** Add this to your global instructions (for Claude
-Code, `~/.claude/CLAUDE.md`) so the model checks the vault before researching a
-topic from scratch — the point being to reuse prior work instead of redoing it:
+**2. A standing directive.** Add this to your global instructions
+(`~/.claude/CLAUDE.md`) so the model both reuses and records without being asked:
 
 ```markdown
-## Search my vault before researching
-Before researching any topic from scratch, first call the attndb `search_vault`
-tool and use any confident match (cite the path). If nothing relevant comes back,
-proceed normally. Search only for now — do not auto-write documents to the vault;
-that capability comes later.
+## Vault: search first, capture after
+1. Before researching a topic from scratch, call attndb `search_vault` first; on
+   a confident match, `read_doc` it and use/extend it rather than redoing the
+   work. Cite path:line.
+2. After substantial research (multi-source work, a synthesized conclusion, a
+   non-obvious answer that took real effort), record it: follow the
+   `attndb-research-capture` skill to `write_doc` a durable note into `/Research/`
+   (or `edit_doc` an existing one), then tell me one line about what you saved.
+   Skip trivia and quick lookups.
 ```
 
-(The "search only" clause is temporary: an autonomous *capture* loop — write
-durable research back into the vault — is a planned follow-on; see
-`docs/proposal-knowledge-capture.md`.)
+This is the flagship loop: research either *uses* prior knowledge or *adds* to
+it. See `docs/proposal-knowledge-capture.md`.
 
 ## Roadmap
 
