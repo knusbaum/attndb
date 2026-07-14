@@ -165,6 +165,37 @@ sub-seconds, and each query is tens of ms.
 Design notes: `docs/live-vault-index.md`. Namespaces (`-ns`) isolate independent
 indexes in one Qdrant (e.g. a vault vs. the sample corpus).
 
+## Guiding an LLM to use the vault
+
+The `search_vault` tool carries enough description to be usable by any MCP client.
+Two optional layers make an LLM reach for it at the right moments:
+
+**1. The `attndb-search` skill (Claude Code).** `skills/attndb-search/SKILL.md`
+is a Claude Code skill that gets auto-surfaced when a question might be covered by
+the vault. It encodes when to search, how to phrase queries, how to read the
+calibrated scores ("a low top score means no confident match"), and to cite the
+source path. Install it by copying or symlinking it into your skills dir:
+
+```
+ln -s "$PWD/skills/attndb-search" ~/.claude/skills/attndb-search
+```
+
+**2. A search-first directive.** Add this to your global instructions (for Claude
+Code, `~/.claude/CLAUDE.md`) so the model checks the vault before researching a
+topic from scratch — the point being to reuse prior work instead of redoing it:
+
+```markdown
+## Search my vault before researching
+Before researching any topic from scratch, first call the attndb `search_vault`
+tool and use any confident match (cite the path). If nothing relevant comes back,
+proceed normally. Search only for now — do not auto-write documents to the vault;
+that capability comes later.
+```
+
+(The "search only" clause is temporary: an autonomous *capture* loop — write
+durable research back into the vault — is a planned follow-on; see
+`docs/proposal-knowledge-capture.md`.)
+
 ## Roadmap
 
 - [x] Pure-Go pass skeleton: chunkers, heatmap accumulator, DB, in-memory pool, stub encoders

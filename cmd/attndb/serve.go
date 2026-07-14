@@ -94,9 +94,15 @@ func runServe(args []string) error {
 	server := mcp.NewServer(&mcp.Implementation{Name: "attndb", Version: "0.1.0"}, nil)
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "search_vault",
-		Description: "Search the indexed document vault with late-interaction semantic retrieval. " +
-			"Returns ranked spans with file path, byte range, calibrated score, and a snippet. " +
-			"Scores are calibrated: a low top score means no confident match.",
+		Description: "Search the user's indexed document vault (their personal notes / knowledge corpus). " +
+			"Reach for this before answering any question the " +
+			"user's own notes might cover — prefer a search over guessing about their specific material. " +
+			"Phrase queries as natural language with specific, entity-rich terms (names, error codes, " +
+			"distinctive nouns); it matches meaning, not exact keywords. Returns ranked spans best-first, " +
+			"each with file path, byte range, a calibrated score, and a text snippet. Scores are calibrated: " +
+			"a low top score means no confident match — say you found nothing relevant rather than dressing " +
+			"up a weak hit. Use a small k (3–5) for focused questions; larger only when surveying. Always " +
+			"cite the path (and byte span) so the user can verify.",
 	}, svc.search)
 
 	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil)
