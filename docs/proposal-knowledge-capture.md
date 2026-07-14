@@ -27,7 +27,7 @@ knowledge or *adds* to it.
 
 ## Not a new silo
 
-`add_doc` writes to the watched folder, which is the user's existing note vault
+`write_doc` writes to the watched folder, which is the user's existing note vault
 (for the primary user, the Obsidian vault). Captured research becomes ordinary
 vault notes, indexed by attndb, integrating with the existing note system rather
 than creating a parallel store. The loop closes on infrastructure already in
@@ -61,7 +61,7 @@ and dedup rules below exist to protect precision.
 
 ### Search-first (works against today's server)
 Before starting research, `search_vault` the question. A confident hit (top
-score above the calibrated gate) → read it (`retrieve_doc`) and use/extend it
+score above the calibrated gate) → read it (`read_doc`) and use/extend it
 rather than redoing the work. This half needs no new tools — `search_vault`
 exists today.
 
@@ -74,7 +74,7 @@ exists today.
 
 ### Dedup — update, don't clone
 Always `search_vault` the topic first. If a closely related doc exists,
-`retrieve_doc` it and `add_doc` to the **same path** with merged/updated content
+`read_doc` it and `write_doc` to the **same path** with merged/updated content
 (overwrite = the delete-then-ingest already built). Otherwise create a new file.
 Semantic dedup is never perfect; the dedicated `Research/` folder is the review
 valve — periodically skim and prune.
@@ -101,7 +101,7 @@ research-heavy sessions produce no capture notices, the directive isn't firing.
 ## Dependencies & phasing
 - **Search-first half → M1.** Works today (`search_vault`); ships with the query
   skill.
-- **Capture half → M2.** Gated on `add_doc` / `retrieve_doc` from the multi-user
+- **Capture half → M2.** Gated on `write_doc` / `read_doc` from the multi-user
   proposal. This **subsumes the "write skill"** in `proposal-llm-skills.md` — it
   *is* that skill, elevated to an autonomous loop.
 

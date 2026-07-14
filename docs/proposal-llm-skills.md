@@ -22,9 +22,9 @@ behavior.
 Two layers:
 
 1. **Strong tool descriptions (baseline, all clients).** The `search_vault` /
-   `add_doc` / `delete_doc` / `retrieve_doc` descriptions are always in context
+   `write_doc` / `delete_doc` / `read_doc` descriptions are always in context
    for *any* MCP client, so they carry the essential when/how guidance (when to
-   search, reading calibrated scores, the search→`retrieve_doc` chain). This is
+   search, reading calibrated scores, the search→`read_doc` chain). This is
    the universal floor and worth investing in regardless. [work]
 2. **Claude Code skills (proactive layer).** `SKILL.md` files in a `skills/` dir
    users drop into `~/.claude/skills`. Unlike user-invoked MCP prompts, skills
@@ -53,13 +53,13 @@ Content the guidance should encode:
 - **k discipline:** small `k` (3–5) for a focused answer; larger only when
   surveying.
 - **Chaining:** results are *spans* (path + byte range + snippet). For real
-  synthesis, call **`retrieve_doc(path)`** to read the whole file for surrounding
+  synthesis, call **`read_doc(path)`** to read the whole file for surrounding
   context rather than answering from the snippet alone (no host filesystem access
   needed — it's a tool). **Always cite** path (and span) so the user can verify.
 
 ## Skill 2 — writing (gated on the filesystem tools)
 
-Depends on the `add_doc`/`delete_doc`/`retrieve_doc` tools from the multi-user
+Depends on the `write_doc`/`delete_doc`/`read_doc` tools from the multi-user
 proposal (phase 1).
 
 > **Elevated in `proposal-knowledge-capture.md`.** This write skill is subsumed
@@ -75,7 +75,7 @@ Content:
   chatter.
 - **Format conventions:** Markdown, a clear H1 title, meaningful path/filename;
   factual and self-contained (it'll be retrieved out of context later).
-- **The contract (eventually-consistent):** `add_doc` writes the file; indexing
+- **The contract (eventually-consistent):** `write_doc` writes the file; indexing
   follows via the watcher a beat later, so it becomes searchable shortly after —
   not synchronously. If the skill wants to **confirm by searching** (the
   add-then-verify loop from the sourdough validation), it should **retry the
@@ -87,8 +87,8 @@ Content:
 ## Recommended path & phasing
 - **Phase 1 (today):** tighten the `search_vault` description; ship the **query**
   `SKILL.md` (works against the server as it exists now).
-- **Phase 2 (with the FS tools):** write descriptions for `add_doc`/`delete_doc`/
-  `retrieve_doc` and ship the **write** `SKILL.md`, once those tools land.
+- **Phase 2 (with the FS tools):** write descriptions for `write_doc`/`delete_doc`/
+  `read_doc` and ship the **write** `SKILL.md`, once those tools land.
 
 ## Decisions made
 - **Delivery:** strong tool descriptions (all clients) + Claude Code `SKILL.md`
@@ -96,5 +96,5 @@ Content:
 
 ## Open items
 - **[work]** Author the query SKILL.md + tighten `search_vault` description.
-- **Dependency:** write skill blocked on the `add_doc`/`delete_doc`/`retrieve_doc`
+- **Dependency:** write skill blocked on the `write_doc`/`delete_doc`/`read_doc`
   tools from `proposal-multi-user.md` (phase 1).

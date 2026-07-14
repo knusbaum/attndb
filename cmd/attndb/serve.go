@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/kjn/attndb/internal/core"
+	"github.com/kjn/attndb/internal/corpus"
 	"github.com/kjn/attndb/internal/db"
 	"github.com/kjn/attndb/internal/reconcile"
 	"github.com/kjn/attndb/internal/watch"
@@ -49,6 +51,14 @@ func runServe(args []string) error {
 	if abs, err := filepath.Abs(root); err == nil {
 		root = abs
 	}
+	// Confined handle for the filesystem tools: os.Root guarantees no operation
+	// escapes the vault via "..", an absolute path, or a symlink pointing out
+	// (it returns an error instead), and is safe for concurrent use.
+	rootFS, err := os.OpenRoot(root)
+	if err != nil {
+		return fmt.Errorf("open vault root: %w", err)
+	}
+	defer rootFS.Close()
 	ctx := context.Background()
 
 	database, err := c.database()
@@ -73,6 +83,7 @@ func runServe(args []string) error {
 		db:        database,
 		rec:       rec,
 		root:      root,
+		rootFS:    rootFS,
 		calibPath: *c.calib,
 		encoder:   *c.encoder,
 		defMin:    *defMin,
@@ -95,15 +106,45 @@ func runServe(args []string) error {
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "search_vault",
 		Description: "Search the user's indexed document vault (their personal notes / knowledge corpus). " +
-			"Reach for this before answering any question the " +
-			"user's own notes might cover — prefer a search over guessing about their specific material. " +
-			"Phrase queries as natural language with specific, entity-rich terms (names, error codes, " +
-			"distinctive nouns); it matches meaning, not exact keywords. Returns ranked spans best-first, " +
-			"each with file path, byte range, a calibrated score, and a text snippet. Scores are calibrated: " +
-			"a low top score means no confident match — say you found nothing relevant rather than dressing " +
-			"up a weak hit. Use a small k (3–5) for focused questions; larger only when surveying. Always " +
-			"cite the path (and byte span) so the user can verify.",
+			"Reach for this before answering any question the user's own notes might cover — prefer a " +
+			"search over guessing about their specific material. Phrase queries as natural language with " +
+			"specific, entity-rich terms (names, error codes, distinctive nouns); it matches meaning, not " +
+			"exact keywords. Returns ranked matches best-first, each with a document path, the line range of " +
+			"the match, a calibrated score, and a snippet. To read more around a match, call read_doc with " +
+			"the path and start line. Scores are calibrated: a low top score means no confident match — say " +
+			"you found nothing relevant rather than dressing up a weak hit. Use a small k (3–5) for focused " +
+			"questions; larger only when surveying. Always cite the path and line so the user can verify.",
 	}, svc.search)
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "read_doc",
+		Description: "Read a document from the user's vault by its absolute vault path, returning its text " +
+			"with line numbers. Reads from line `offset` (default 1) for up to `limit` lines (default 2000); " +
+			"page through a large document by advancing `offset` instead of pulling it all into context. " +
+			"Pairs with search_vault, which gives you a path and start line to read around. Convention: read " +
+			"a document before editing it.",
+	}, svc.readDoc)
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "write_doc",
+		Description: "Create or overwrite a markdown document in the user's vault at an absolute vault path, " +
+			"creating parent folders as needed. Use it to save durable notes or research so they become " +
+			"searchable later. A written document becomes searchable shortly after, not instantly — to " +
+			"confirm it landed, search again after a moment rather than expecting an immediate hit. For " +
+			"changing part of an existing document prefer edit_doc over rewriting the whole thing. Paths " +
+			"must be inside the vault and end in .md.",
+	}, svc.writeDoc)
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "edit_doc",
+		Description: "Edit a document in the user's vault by replacing an exact string. `old_string` must " +
+			"match the file exactly and be unique, unless `replace_all` is set. Prefer this over rewriting a " +
+			"whole document when you are updating part of it. Convention: read the document first, and strip " +
+			"the line-number prefix that read_doc adds before matching. Paths must be inside the vault and " +
+			"end in .md.",
+	}, svc.editDoc)
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "delete_doc",
+		Description: "Delete a document from the user's vault by its absolute vault path. It stops being " +
+			"searchable shortly after removal. Paths must be inside the vault and end in .md.",
+	}, svc.deleteDoc)
 
 	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil)
 	log.Printf("attndb MCP server listening on http://%s (ns=%q, docs=%s)", *addr, *c.ns, root)
@@ -111,11 +152,12 @@ func runServe(args []string) error {
 }
 
 // vaultService bundles the resident DB, reconciler, and calibration policy that
-// the watch loop and the MCP tool share.
+// the watch loop and the MCP tools share.
 type vaultService struct {
 	db        *db.DB
 	rec       *reconcile.Reconciler
-	root      string
+	root      string   // canonical absolute path of the vault root on the host
+	rootFS    *os.Root // confined handle: all tool filesystem ops go through it
 	calibPath string
 	encoder   string
 	defMin    float64
@@ -234,11 +276,11 @@ type searchInput struct {
 }
 
 type searchHit struct {
-	Path    string  `json:"path" jsonschema:"vault-relative path of the matching document"`
-	Start   int     `json:"start" jsonschema:"start byte offset of the matched span"`
-	End     int     `json:"end" jsonschema:"end byte offset of the matched span"`
-	Score   float64 `json:"score" jsonschema:"calibrated relevance score"`
-	Snippet string  `json:"snippet" jsonschema:"text of the matched span"`
+	Path      string  `json:"path" jsonschema:"absolute vault path of the matching document"`
+	StartLine int     `json:"start_line" jsonschema:"1-based first line of the matched span"`
+	EndLine   int     `json:"end_line" jsonschema:"1-based last line of the matched span"`
+	Score     float64 `json:"score" jsonschema:"calibrated relevance score"`
+	Snippet   string  `json:"snippet" jsonschema:"text of the matched span"`
 }
 
 type searchOutput struct {
@@ -263,12 +305,13 @@ func (s *vaultService) search(ctx context.Context, _ *mcp.CallToolRequest, in se
 	hits := make([]searchHit, 0, len(results))
 	var b strings.Builder
 	for i, r := range results {
-		sn := s.readSnippet(r.DocID, r.Span)
+		sn, startLine, endLine := s.spanPreview(r.DocID, r.Span)
+		apiPath := "/" + filepath.ToSlash(r.DocID)
 		hits = append(hits, searchHit{
-			Path: r.DocID, Start: r.Span.Start, End: r.Span.End,
+			Path: apiPath, StartLine: startLine, EndLine: endLine,
 			Score: float64(r.Score), Snippet: sn,
 		})
-		fmt.Fprintf(&b, "%d. [%.3f] %s (bytes %d–%d)\n   %s\n", i+1, r.Score, r.DocID, r.Span.Start, r.Span.End, sn)
+		fmt.Fprintf(&b, "%d. [%.3f] %s:%d\n   %s\n", i+1, r.Score, apiPath, startLine, sn)
 	}
 	text := b.String()
 	if text == "" {
@@ -277,13 +320,16 @@ func (s *vaultService) search(ctx context.Context, _ *mcp.CallToolRequest, in se
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}, searchOutput{Hits: hits}, nil
 }
 
-// readSnippet reads the matched span fresh from disk so the text is always
-// current. Spans are clamped: a file edited since indexing may have shifted,
-// and its stored offsets can run past the current length until re-ingest.
-func (s *vaultService) readSnippet(docID string, span core.Span) string {
-	b, err := os.ReadFile(filepath.Join(s.root, docID))
+// spanPreview reads the matched span fresh from disk and returns the snippet
+// plus the 1-based line range it falls on. Reading current content (rather than
+// storing it) keeps the preview and a follow-up read_doc on the same live-disk
+// basis, so the line we report leads read_doc to the previewed text. Spans are
+// clamped: a file edited since indexing may have shifted, and its stored offsets
+// can run past the current length until the watcher re-ingests it.
+func (s *vaultService) spanPreview(docID string, span core.Span) (snip string, startLine, endLine int) {
+	b, err := s.rootFS.ReadFile(docID)
 	if err != nil {
-		return ""
+		return "", 0, 0
 	}
 	text := string(b)
 	sp := span
@@ -293,5 +339,218 @@ func (s *vaultService) readSnippet(docID string, span core.Span) string {
 	if sp.Start > sp.End {
 		sp.Start = sp.End
 	}
-	return snippet(text, sp)
+	return snippet(text, sp), lineOf(text, sp.Start), lineOf(text, sp.End)
+}
+
+// lineOf returns the 1-based line number that byte offset off falls on.
+func lineOf(text string, off int) int {
+	if off > len(text) {
+		off = len(text)
+	}
+	if off < 0 {
+		off = 0
+	}
+	return 1 + strings.Count(text[:off], "\n")
+}
+
+// --- filesystem tools: read_doc / write_doc / edit_doc / delete_doc ---
+//
+// A thin read/write interface over the watched vault folder, mirroring the shape
+// of the host filesystem tools (Read/Write/Edit) so a model already fluent in
+// those performs well here. Paths are absolute *within the vault* ("/" = vault
+// root); vaultName maps them to the confined os.Root, which guarantees no
+// operation escapes the tree. The write tools only touch the filesystem — they
+// never index directly: the watcher notices the change and the reconciler
+// indexes it a beat later, keeping the folder the sole sync entry point and the
+// recalibration policy (which counts changes in the watch loop) intact.
+// Searchability is therefore eventually-consistent: a caller that must confirm a
+// write should re-search briefly rather than expect an instant hit.
+//
+// Convention (documented, not enforced here because MCP is stateless): read a
+// document before overwriting/editing it. edit_doc's unique-old_string
+// requirement is the safety net against blind edits.
+
+const readDocDefaultLimit = 2000 // lines, matching the host Read tool's default
+
+type readDocInput struct {
+	Path   string `json:"path" jsonschema:"absolute vault path of the document, e.g. /Research/2026-07-14-topic.md"`
+	Offset int    `json:"offset,omitempty" jsonschema:"1-based line to start reading from (default 1)"`
+	Limit  int    `json:"limit,omitempty" jsonschema:"maximum number of lines to read (default 2000)"`
+}
+type readDocOutput struct {
+	Path       string `json:"path" jsonschema:"the absolute vault path read"`
+	Content    string `json:"content" jsonschema:"the requested lines, each prefixed with its line number"`
+	StartLine  int    `json:"start_line" jsonschema:"1-based line of the first returned line"`
+	EndLine    int    `json:"end_line" jsonschema:"1-based line of the last returned line"`
+	TotalLines int    `json:"total_lines" jsonschema:"total number of lines in the document"`
+}
+
+func (s *vaultService) readDoc(_ context.Context, _ *mcp.CallToolRequest, in readDocInput) (*mcp.CallToolResult, readDocOutput, error) {
+	name, err := vaultName(in.Path)
+	if err != nil {
+		return nil, readDocOutput{}, err
+	}
+	b, err := s.rootFS.ReadFile(name)
+	if err != nil {
+		return nil, readDocOutput{}, err
+	}
+	lines := strings.Split(string(b), "\n")
+	// A trailing newline yields a final empty element; drop it so line counts
+	// match what an editor shows.
+	if n := len(lines); n > 0 && lines[n-1] == "" {
+		lines = lines[:n-1]
+	}
+	total := len(lines)
+
+	start := in.Offset
+	if start <= 0 {
+		start = 1
+	}
+	limit := in.Limit
+	if limit <= 0 {
+		limit = readDocDefaultLimit
+	}
+	if start > total {
+		start = total + 1 // nothing to return
+	}
+	end := start + limit - 1
+	if end > total {
+		end = total
+	}
+
+	var b2 strings.Builder
+	for i := start; i <= end; i++ {
+		fmt.Fprintf(&b2, "%6d\t%s\n", i, lines[i-1])
+	}
+	content := b2.String()
+	out := readDocOutput{Path: in.Path, Content: content, StartLine: start, EndLine: end, TotalLines: total}
+	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: content}}}, out, nil
+}
+
+type writeDocInput struct {
+	Path    string `json:"path" jsonschema:"absolute vault path of the .md document, e.g. /Research/2026-07-14-topic.md"`
+	Content string `json:"content" jsonschema:"full markdown content of the document"`
+}
+type writeDocOutput struct {
+	Path string `json:"path" jsonschema:"the absolute vault path written"`
+}
+
+func (s *vaultService) writeDoc(_ context.Context, _ *mcp.CallToolRequest, in writeDocInput) (*mcp.CallToolResult, writeDocOutput, error) {
+	name, err := vaultName(in.Path)
+	if err != nil {
+		return nil, writeDocOutput{}, err
+	}
+	if dir := filepath.Dir(name); dir != "." {
+		if err := s.rootFS.MkdirAll(dir, 0o755); err != nil {
+			return nil, writeDocOutput{}, err
+		}
+	}
+	if err := s.rootFS.WriteFile(name, []byte(in.Content), 0o644); err != nil {
+		return nil, writeDocOutput{}, err
+	}
+	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{
+		Text: fmt.Sprintf("Wrote %s (searchable shortly)", in.Path),
+	}}}, writeDocOutput{Path: in.Path}, nil
+}
+
+type editDocInput struct {
+	Path       string `json:"path" jsonschema:"absolute vault path of the .md document to edit"`
+	OldString  string `json:"old_string" jsonschema:"exact text to replace (must be unique unless replace_all)"`
+	NewString  string `json:"new_string" jsonschema:"text to replace it with"`
+	ReplaceAll bool   `json:"replace_all,omitempty" jsonschema:"replace every occurrence instead of requiring a unique match"`
+}
+type editDocOutput struct {
+	Path         string `json:"path" jsonschema:"the absolute vault path edited"`
+	Replacements int    `json:"replacements" jsonschema:"number of occurrences replaced"`
+}
+
+func (s *vaultService) editDoc(_ context.Context, _ *mcp.CallToolRequest, in editDocInput) (*mcp.CallToolResult, editDocOutput, error) {
+	name, err := vaultName(in.Path)
+	if err != nil {
+		return nil, editDocOutput{}, err
+	}
+	if in.OldString == "" {
+		return nil, editDocOutput{}, fmt.Errorf("old_string is required")
+	}
+	if in.OldString == in.NewString {
+		return nil, editDocOutput{}, fmt.Errorf("old_string and new_string are identical")
+	}
+	b, err := s.rootFS.ReadFile(name)
+	if err != nil {
+		return nil, editDocOutput{}, err
+	}
+	text := string(b)
+	n := strings.Count(text, in.OldString)
+	if n == 0 {
+		return nil, editDocOutput{}, fmt.Errorf("old_string not found in %s", in.Path)
+	}
+	var updated string
+	if in.ReplaceAll {
+		updated = strings.ReplaceAll(text, in.OldString, in.NewString)
+	} else {
+		if n > 1 {
+			return nil, editDocOutput{}, fmt.Errorf("old_string is not unique in %s (%d matches); make it more specific or set replace_all", in.Path, n)
+		}
+		updated = strings.Replace(text, in.OldString, in.NewString, 1)
+		n = 1
+	}
+	if err := s.rootFS.WriteFile(name, []byte(updated), 0o644); err != nil {
+		return nil, editDocOutput{}, err
+	}
+	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{
+		Text: fmt.Sprintf("Edited %s (%d replacement(s))", in.Path, n),
+	}}}, editDocOutput{Path: in.Path, Replacements: n}, nil
+}
+
+type deleteDocInput struct {
+	Path string `json:"path" jsonschema:"absolute vault path of the document to delete"`
+}
+type deleteDocOutput struct {
+	Path string `json:"path" jsonschema:"the absolute vault path deleted"`
+}
+
+func (s *vaultService) deleteDoc(_ context.Context, _ *mcp.CallToolRequest, in deleteDocInput) (*mcp.CallToolResult, deleteDocOutput, error) {
+	name, err := vaultName(in.Path)
+	if err != nil {
+		return nil, deleteDocOutput{}, err
+	}
+	if err := s.rootFS.Remove(name); err != nil {
+		return nil, deleteDocOutput{}, err
+	}
+	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{
+		Text: fmt.Sprintf("Deleted %s", in.Path),
+	}}}, deleteDocOutput{Path: in.Path}, nil
+}
+
+// vaultName validates a caller-supplied vault path and returns the name to pass
+// to the confined os.Root. Paths are absolute within the vault ("/" = the vault
+// root); os.Root is the actual guard against escaping the tree (via "..", an
+// absolute host path, or a symlink pointing out). On top of that safety this
+// enforces policy — only .md files are addressable and hidden components
+// (.obsidian, .git, …) are refused — so the tools match what the indexer indexes
+// and cannot touch dotfile config trees.
+//
+// This is a trusted small-team tool: os.Root notes it does not fully defend
+// against TOCTOU races on some platforms, which we accept here.
+func vaultName(p string) (string, error) {
+	if p == "" || !strings.HasPrefix(p, "/") {
+		return "", fmt.Errorf("path must be absolute within the vault (start with '/'): %q", p)
+	}
+	// POSIX cleaning on the logical vault path: for an absolute path filepath's
+	// Clean clamps any ".." at the root, so it cannot express a location outside
+	// the vault; os.Root re-checks regardless.
+	clean := path.Clean(p)
+	name := strings.TrimPrefix(clean, "/")
+	if name == "" || name == "." {
+		return "", fmt.Errorf("path must name a file, not the vault root: %q", p)
+	}
+	if !corpus.IsIndexable(name) {
+		return "", fmt.Errorf("only .md files are addressable: %q", p)
+	}
+	for _, part := range strings.Split(name, "/") {
+		if strings.HasPrefix(part, ".") {
+			return "", fmt.Errorf("hidden paths are not addressable: %q", p)
+		}
+	}
+	return filepath.FromSlash(name), nil
 }

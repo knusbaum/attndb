@@ -13,6 +13,17 @@ ONNX := CGO_LDFLAGS="-L$(LIBS)" go build -tags onnx
 # pick it up without the caller having to set it.
 export ATTNDB_ORT_LIB := $(LIBS)/libonnxruntime.1.27.0.dylib
 
+# POST_ONNX runs after `make onnx` builds the binary — a seam for machine-local
+# build steps that don't belong in this shared Makefile, chiefly codesigning on
+# macOS (a stable signature keeps a Full Disk Access grant alive across rebuilds;
+# Go's default ad-hoc signature changes every build and loses it). Empty here;
+# set it in Makefile.local (git-ignored). See Makefile.local.example.
+POST_ONNX ?=
+
+# Machine-local overrides (git-ignored): POST_ONNX, personal run targets, etc.
+# The leading '-' makes this a no-op when the file is absent.
+-include Makefile.local
+
 .DEFAULT_GOAL := build
 .PHONY: build onnx test vet fmt ingest search clean
 
@@ -21,6 +32,7 @@ build:
 
 onnx:
 	$(ONNX) -o attndb ./cmd/attndb
+	$(POST_ONNX)
 
 test:
 	go test ./...

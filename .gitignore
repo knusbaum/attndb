@@ -18,5 +18,9 @@
 /corpus/
 /corpus_milou/
 
+# Machine-local make overrides (POST_ONNX, personal run targets); see
+# Makefile.local.example. The .example file IS committed.
+/Makefile.local
+
 # Agent session scratch (worktrees, eval scripts)
 /.claude/

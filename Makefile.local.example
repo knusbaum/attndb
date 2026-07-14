@@ -1,0 +1,19 @@
+# Copy to Makefile.local (git-ignored) for machine-specific build settings.
+# The main Makefile does `-include Makefile.local`, so anything here is optional.
+
+# POST_ONNX runs after `make onnx` builds the binary. On macOS, sign it with a
+# stable code-signing identity so a Full Disk Access grant survives rebuilds:
+# Go's default ad-hoc signature changes every build and drops the TCC grant,
+# which is why a freshly rebuilt binary suddenly can't read ~/Documents. Create a
+# self-signed *Code Signing* cert in Keychain Access (Certificate Assistant →
+# Create a Certificate → Certificate Type: Code Signing), then:
+#
+# POST_ONNX = codesign --force --sign "your-codesign-identity" attndb
+
+# A convenience target to run the daemon against your own docs directory:
+#
+# runvault: onnx
+# 	./attndb serve -store qdrant -encoder onnx -provider cpu -ns vault \
+# 	  -docs "/path/to/your/vault" \
+# 	  -calib .attndb-vault-calibration.json -addr localhost:8765
+# .PHONY: runvault

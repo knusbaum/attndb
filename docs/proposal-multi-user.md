@@ -50,14 +50,22 @@ path (exactly the add/delete loop validated by the sourdough test). We do not
 build a separate upload store or a second ingest path.
 
 The remote interface is a thin **read/write API over the backing filesystem**,
-three MCP tools that operate on files in the watched folder:
+MCP tools that operate on files in the watched folder. As built they mirror the
+shape of the host Read/Write/Edit tools (so an LLM already fluent in those uses
+them well); paths are **absolute within the vault** (`/` = the vault root) and
+confined via Go's `os.Root`:
 
-- **`add_doc(path, content)`** — write a file into the watched tree. Indexing
-  follows automatically via the watcher; the tool does not ingest directly.
+- **`write_doc(path, content)`** — create/overwrite a file in the watched tree.
+  Indexing follows automatically via the watcher; the tool does not ingest
+  directly.
+- **`edit_doc(path, old_string, new_string, replace_all?)`** — exact-string
+  replacement, for updating part of a file without rewriting it (the capture
+  loop's update-in-place path).
 - **`delete_doc(path)`** — remove a file from the tree (watcher drops it).
-- **`retrieve_doc(path)`** — read a file's full content back. Complements
-  `search_vault` (which returns spans/snippets): the search→read-full-context
-  chain becomes two tools instead of requiring host filesystem access.
+- **`read_doc(path, offset?, limit?)`** — read a file's text back, line-numbered
+  and paged (default 2000 lines). Complements `search_vault`, which returns
+  `path` + line range: the search→read-context chain becomes two tools instead of
+  requiring host filesystem access.
 
 Because these are just filesystem operations, the server owns no new storage
 model and snippets keep reading from the same on-disk copy. The design keeps one
@@ -65,11 +73,11 @@ invariant: **the filesystem is the source of truth; the index is a projection of
 it.** Anything that can put a file in the folder (these tools, a synced vault, a
 git push, a future mount) feeds the same sync.
 
-*Note — searchability is eventually-consistent by design.* `add_doc` returns once
+*Note — searchability is eventually-consistent by design.* `write_doc` returns once
 the file is written; the doc becomes searchable a beat later when the watcher
 reconciles it (sub-second in practice). A caller that needs confirm-on-return
 (e.g. an LLM upload skill that verifies by searching) can poll `search_vault`/
-`retrieve_doc` briefly. We are intentionally *not* coupling `add_doc` to the
+`read_doc` briefly. We are intentionally *not* coupling `write_doc` to the
 ingest path — keeping the folder as the sole sync entry point is worth the small
 window.
 
@@ -96,8 +104,8 @@ appears; the `-ns` flag already partitions collections in Qdrant if we ever do.
 
 ## Recommended path & phasing
 - **Phase 1:** compose stack (attndb + Qdrant + Caddy), TLS + static-token auth,
-  one shared index, watched-folder sync + the `add_doc`/`delete_doc`/
-  `retrieve_doc` filesystem tools. Delivers "a team queries and grows a shared
+  one shared index, watched-folder sync + the `write_doc`/`delete_doc`/
+  `read_doc` filesystem tools. Delivers "a team queries and grows a shared
   index."
 - **Phase 2 (later):** mountable backing folder over SMB / a filesystem protocol,
   so users manage docs as ordinary files — still the one sync entry point.
@@ -105,7 +113,7 @@ appears; the `-ns` flag already partitions collections in Qdrant if we ever do.
 
 ## Decisions made
 - **Doc-add:** watched folder is the sole sync entry point; expose it via thin
-  `add_doc`/`delete_doc`/`retrieve_doc` filesystem tools. No separate upload store.
+  `write_doc`/`delete_doc`/`read_doc` filesystem tools. No separate upload store.
 - **Isolation:** out of scope — one shared index, no per-user/team namespaces.
 
 ## Open items
