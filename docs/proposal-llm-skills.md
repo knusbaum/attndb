@@ -60,7 +60,16 @@ Content the guidance should encode:
 ## Skill 2 — writing (gated on the filesystem tools)
 
 Depends on the `add_doc`/`delete_doc`/`retrieve_doc` tools from the multi-user
-proposal (phase 1). Content:
+proposal (phase 1).
+
+> **Elevated in `proposal-knowledge-capture.md`.** This write skill is subsumed
+> by the autonomous knowledge-capture loop — same tools, but driven by a standing
+> directive so research outcomes get recorded *without* the user asking, and
+> paired with a search-first rule so prior research is found before it's redone.
+> Treat the bullets below as the mechanical baseline; the capture proposal is the
+> full behavior.
+
+Content:
 - **When to add:** the user says "save/remember this," produces a document worth
   retrieving later, or the LLM synthesizes something durable. Not for transient
   chatter.
