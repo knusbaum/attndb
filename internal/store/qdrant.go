@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"sync"
 
 	"github.com/kjn/attndb/internal/core"
@@ -120,6 +121,68 @@ func (q *Qdrant) Upsert(ctx context.Context, recs []Record) error {
 		return fmt.Errorf("qdrant upsert %s: %w", q.name, err)
 	}
 	return nil
+}
+
+// Delete removes every point whose doc_id payload equals docID. It is a no-op
+// if the collection does not exist yet (nothing has been ingested).
+func (q *Qdrant) Delete(ctx context.Context, docID string) error {
+	exists, err := q.client.CollectionExists(ctx, q.name)
+	if err != nil {
+		return fmt.Errorf("qdrant exists %s: %w", q.name, err)
+	}
+	if !exists {
+		return nil
+	}
+	sel := qdrant.NewPointsSelectorFilter(toFilter(map[string]any{"doc_id": docID}))
+	wait := true // block until applied so a following re-ingest/search sees the removal
+	if _, err := q.client.Delete(ctx, &qdrant.DeletePoints{
+		CollectionName: q.name,
+		Points:         sel,
+		Wait:           &wait,
+	}); err != nil {
+		return fmt.Errorf("qdrant delete %s (doc_id=%s): %w", q.name, docID, err)
+	}
+	return nil
+}
+
+// Stamps scrolls the whole collection and returns each doc_id's mtime/sha. On
+// the whole-doc pass (one point per doc) this is the index-of-record; on a
+// multi-point pass it dedupes per doc_id (all a doc's points share the stamp).
+func (q *Qdrant) Stamps(ctx context.Context) (map[string]DocStamp, error) {
+	out := make(map[string]DocStamp)
+	exists, err := q.client.CollectionExists(ctx, q.name)
+	if err != nil {
+		return nil, fmt.Errorf("qdrant exists %s: %w", q.name, err)
+	}
+	if !exists {
+		return out, nil
+	}
+	limit := uint32(1024)
+	it := q.client.ScrollAll(ctx, &qdrant.ScrollPoints{
+		CollectionName: q.name,
+		Limit:          &limit,
+		WithPayload:    qdrant.NewWithPayload(true),
+	})
+	for {
+		points, err := it.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("qdrant scroll %s: %w", q.name, err)
+		}
+		for _, p := range points {
+			doc := payloadString(p.Payload, "doc_id")
+			if doc == "" {
+				continue
+			}
+			out[doc] = DocStamp{
+				MTime: payloadInt(p.Payload, "mtime"),
+				SHA:   payloadString(p.Payload, "sha"),
+			}
+		}
+	}
+	return out, nil
 }
 
 func (q *Qdrant) SearchSingle(ctx context.Context, vec []float32, k int, filters map[string]any) ([]Scored, error) {

@@ -62,3 +62,35 @@ func TestSearchNoResults(t *testing.T) {
 		t.Fatalf("expected no results from empty DB, got %d", len(results))
 	}
 }
+
+// TestCalibrationSwapRace runs Search concurrently with SetCalibration to prove
+// the calibration swap is data-race-free (run with -race).
+func TestCalibrationSwapRace(t *testing.T) {
+	single := encode.NewStubSingle(64)
+	multi := encode.NewStubMulti(64)
+	d := New([]pass.Pass{
+		pass.NewPerTokenPass("tok", chunk.BySection(256, 32), multi, store.NewMemory("tok")),
+		pass.NewSingleVectorPass("para", chunk.ByParagraph(), single, store.NewMemory("para")),
+		pass.NewSingleVectorPass("doc", chunk.WholeDoc(), single, store.NewMemory("doc")),
+	})
+	ctx := context.Background()
+	d.Ingest(ctx, []core.Document{{ID: "d", Text: "# T\n\nRetries use backoff.\n"}})
+
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 200; i++ {
+			d.SetCalibration(Calibration{
+				"tok":  {Lo: 0.1, Hi: 0.9},
+				"para": {Lo: 0.2, Hi: 0.8},
+				"doc":  {Lo: 0.3, Hi: 0.7},
+			})
+		}
+		close(done)
+	}()
+	for i := 0; i < 200; i++ {
+		if _, err := d.Search(ctx, core.Query{Text: "backoff"}, 3); err != nil {
+			t.Fatalf("search: %v", err)
+		}
+	}
+	<-done
+}

@@ -31,6 +31,10 @@ type fakePool struct{ score float32 }
 
 func (fakePool) Name() string                                 { return "fake" }
 func (fakePool) Upsert(context.Context, []store.Record) error { return nil }
+func (fakePool) Delete(context.Context, string) error         { return nil }
+func (fakePool) Stamps(context.Context) (map[string]store.DocStamp, error) {
+	return nil, nil
+}
 func (fakePool) SearchSingle(context.Context, []float32, int, map[string]any) ([]store.Scored, error) {
 	return nil, nil
 }

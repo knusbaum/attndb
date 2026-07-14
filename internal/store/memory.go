@@ -43,6 +43,34 @@ func (m *Memory) Upsert(_ context.Context, recs []Record) error {
 	return nil
 }
 
+func (m *Memory) Delete(_ context.Context, docID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for id, r := range m.recs {
+		if r.DocID == docID {
+			delete(m.recs, id)
+		}
+	}
+	return nil
+}
+
+func (m *Memory) Stamps(_ context.Context) (map[string]DocStamp, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make(map[string]DocStamp)
+	for _, r := range m.recs {
+		st := out[r.DocID]
+		if v, ok := r.Payload["mtime"].(int64); ok {
+			st.MTime = v
+		}
+		if v, ok := r.Payload["sha"].(string); ok {
+			st.SHA = v
+		}
+		out[r.DocID] = st
+	}
+	return out, nil
+}
+
 func (m *Memory) SearchSingle(_ context.Context, vec []float32, k int, filters map[string]any) ([]Scored, error) {
 	return m.topK(k, func(r Record) (float32, bool) {
 		if r.Vector == nil {

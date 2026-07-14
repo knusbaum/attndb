@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,6 +22,7 @@ import (
 
 	"github.com/kjn/attndb/internal/chunk"
 	"github.com/kjn/attndb/internal/core"
+	"github.com/kjn/attndb/internal/corpus"
 	"github.com/kjn/attndb/internal/db"
 	"github.com/kjn/attndb/internal/encode"
 	"github.com/kjn/attndb/internal/pass"
@@ -46,6 +46,8 @@ func main() {
 		err = runSearch(args)
 	case "query":
 		err = runQuery(args)
+	case "serve":
+		err = runServe(args)
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -66,6 +68,7 @@ commands:
   ingest   encode documents and store them (use -store qdrant to persist)
   search   query an already-ingested store (no re-encoding)
   query    one-shot: ingest then search in one process (good for -store memory)
+  serve    long-running daemon: watch docs, keep the index synced, search over MCP
 
 common flags: -store memory|qdrant  -qdrant host:port  -encoder stub|onnx
               -provider cpu|coreml  -model dir  -dim N  -docs dir
@@ -75,8 +78,8 @@ search/query: -k N  -filter key=value
 
 // common holds the flags shared by all subcommands.
 type common struct {
-	store, qaddr, encoder, provider, model, docs, calib *string
-	dim                                                 *int
+	store, qaddr, encoder, provider, model, docs, calib, ns *string
+	dim                                                     *int
 	// retrieval tuning knobs (exposed for measurement/A-B; see buildDB)
 	recallK                 *int
 	peak, wTok, wPara, wDoc *float64
@@ -91,6 +94,7 @@ func registerCommon(fs *flag.FlagSet) *common {
 		model:    fs.String("model", "models", "model directory (onnx encoder)"),
 		docs:     fs.String("docs", "./sample_docs", "documents directory"),
 		calib:    fs.String("calib", ".attndb-calibration.json", "calibration file (written by ingest, read by search)"),
+		ns:       fs.String("ns", "", "collection namespace: isolates this index from others in the same store (empty = default shared collections)"),
 		dim:      fs.Int("dim", 64, "stub embedding dimension"),
 		recallK:  fs.Int("recallK", 50, "candidates each pass contributes before fusion"),
 		peak:     fs.Float64("peak", 0.5, "peak-region growth fraction (heat accumulation)"),
@@ -109,7 +113,7 @@ func (c *common) database() (*db.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	return buildDB(multi, single, *c.encoder, mk, tuning{
+	return buildDB(multi, single, *c.encoder, *c.ns, mk, tuning{
 		recallK: *c.recallK, peak: *c.peak,
 		wTok: *c.wTok, wPara: *c.wPara, wDoc: *c.wDoc,
 	})
@@ -292,19 +296,24 @@ type tuning struct {
 	wTok, wPara, wDoc float64
 }
 
-func buildDB(multi core.MultiVectorEncoder, single core.SingleVectorEncoder, encKind string, mk func(string) (store.Pool, error), t tuning) (*db.DB, error) {
+func buildDB(multi core.MultiVectorEncoder, single core.SingleVectorEncoder, encKind, ns string, mk func(string) (store.Pool, error), t tuning) (*db.DB, error) {
 	// collection names are encoder-scoped so different encoders (and dims) don't
-	// collide in the same store
+	// collide in the same store. An optional namespace further isolates a corpus
+	// (e.g. the Obsidian vault) from the default shared collections.
+	prefix := "attndb"
+	if ns != "" {
+		prefix += "_" + ns
+	}
 	suffix := "_" + encKind
-	tokPool, err := mk("attndb_tok_section" + suffix)
+	tokPool, err := mk(prefix + "_tok_section" + suffix)
 	if err != nil {
 		return nil, err
 	}
-	paraPool, err := mk("attndb_para" + suffix)
+	paraPool, err := mk(prefix + "_para" + suffix)
 	if err != nil {
 		return nil, err
 	}
-	docPool, err := mk("attndb_doc" + suffix)
+	docPool, err := mk(prefix + "_doc" + suffix)
 	if err != nil {
 		return nil, err
 	}
@@ -432,27 +441,9 @@ func gate(results []core.Result, min float64) []core.Result {
 	return out
 }
 
+// loadDocs walks dir for indexable, stamped documents (see internal/corpus).
 func loadDocs(dir string) ([]core.Document, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, err
-	}
-	var docs []core.Document
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
-			continue
-		}
-		b, err := os.ReadFile(filepath.Join(dir, e.Name()))
-		if err != nil {
-			return nil, err
-		}
-		docs = append(docs, core.Document{
-			ID:   e.Name(),
-			Text: string(b),
-			Meta: map[string]any{"path": e.Name()},
-		})
-	}
-	return docs, nil
+	return corpus.LoadDir(dir)
 }
 
 // loadText reads document text for snippet rendering without building Documents.

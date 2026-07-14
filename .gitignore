@@ -10,8 +10,9 @@
 # Local Qdrant storage
 /qdrant_storage/
 
-# Generated calibration (produced by `ingest`, tied to a specific corpus)
-/.attndb-calibration.json
+# Generated calibration (produced by `ingest`/`serve`, tied to a specific
+# corpus/namespace — may reflect private content; never commit)
+/.attndb-*calibration.json
 
 # Local document corpora — may contain sensitive/internal material; never commit
 /corpus/

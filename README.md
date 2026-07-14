@@ -137,6 +137,34 @@ Inputs are padded to fixed shapes (ColBERT: 48/300 tokens; single-vector: 512 to
 so CoreML can compile a static graph. Without static shapes the CoreML EP falls back
 to CPU for transformer ops.
 
+## Live index + MCP server (`serve`)
+
+`attndb serve` is a long-running daemon that keeps a directory tree indexed as
+its files change and answers searches over MCP (Streamable HTTP). It builds the
+DB once so the encoders stay resident — a changed file re-indexes in
+sub-seconds, and each query is tens of ms.
+
+```
+./attndb serve -store qdrant -encoder onnx -provider cpu -ns vault \
+  -docs "/path/to/vault" -calib .attndb-vault-calibration.json -addr localhost:8765
+```
+
+- **Watch + reconcile.** A file watcher (FSEvents on macOS, polling elsewhere)
+  drives a reconciler that diffs the tree against the index: adds/edits →
+  delete-then-ingest (point IDs are span-derived, so a bare re-ingest would
+  orphan old spans), deletes → drop. A periodic `-resync` ReconcileAll backstops
+  bulk/directory operations the granular watcher can miss. Change detection uses
+  an `(mtime, sha)` stamp stored in each point's payload, so restarts don't
+  re-ingest unchanged files.
+- **Calibration** is refreshed lazily as the corpus drifts (idle debounce +
+  churn ceiling), recomputed in the background and swapped in atomically.
+- **Tool:** `search_vault(query, k?, min?)` → ranked `{path, span, score,
+  snippet}`; snippets are read fresh from disk. `min` exposes the calibrated
+  relevance gate so a consumer can tell "no confident match" from "weak hits".
+
+Design notes: `docs/live-vault-index.md`. Namespaces (`-ns`) isolate independent
+indexes in one Qdrant (e.g. a vault vs. the sample corpus).
+
 ## Roadmap
 
 - [x] Pure-Go pass skeleton: chunkers, heatmap accumulator, DB, in-memory pool, stub encoders
@@ -145,6 +173,10 @@ to CPU for transformer ops.
 - [x] Qdrant `Pool` (Go client; native multivector MaxSim + payload filtering)
 - [x] Real ONNX encoders: GTE-ModernColBERT (per-token) + gte-modernbert-base (single-vector)
 - [x] Mac/Metal acceleration spike: CoreML Execution Provider via ONNX Runtime (`-provider coreml`)
+- [x] Namespaced collections (`-ns`) so independent corpora share one Qdrant
+- [x] Recursive ingest (subdirectories; relative-path doc IDs)
+- [x] Live index daemon: file watcher + reconciler + incremental (re-)index, lazy recalibration
+- [x] `search_vault` over MCP (Streamable HTTP), calibrated relevance gate
 - [ ] Encoder batching (currently one forward pass per text)
 - [ ] Token-level sub-span refinement over Qdrant (store offsets in payload, read vectors back)
 - [ ] Eval / bake-off harness sweeping pass configurations

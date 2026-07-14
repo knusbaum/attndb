@@ -22,6 +22,10 @@ type Pass interface {
 	// passes so they don't double-count one viewpoint).
 	Weight() float64
 	Ingest(ctx context.Context, docs []core.Document) error
+	// Delete removes every record for docID from this pass's pool.
+	Delete(ctx context.Context, docID string) error
+	// Stamps returns per-doc change-detection stamps from this pass's pool.
+	Stamps(ctx context.Context) (map[string]store.DocStamp, error)
 	// Deposits returns this pass's scored intervals for a query (up to k).
 	Deposits(ctx context.Context, q core.Query, k int) ([]core.Candidate, error)
 }
@@ -62,6 +66,14 @@ func NewSingleVectorPass(name string, ch chunk.Chunker, enc core.SingleVectorEnc
 
 func (p *SingleVectorPass) Name() string    { return p.name }
 func (p *SingleVectorPass) Weight() float64 { return p.opt.weight }
+
+func (p *SingleVectorPass) Delete(ctx context.Context, docID string) error {
+	return p.pool.Delete(ctx, docID)
+}
+
+func (p *SingleVectorPass) Stamps(ctx context.Context) (map[string]store.DocStamp, error) {
+	return p.pool.Stamps(ctx)
+}
 
 func (p *SingleVectorPass) Ingest(ctx context.Context, docs []core.Document) error {
 	for _, d := range docs {
@@ -129,6 +141,14 @@ func NewPerTokenPass(name string, ch chunk.Chunker, enc core.MultiVectorEncoder,
 
 func (p *PerTokenPass) Name() string    { return p.name }
 func (p *PerTokenPass) Weight() float64 { return p.opt.weight }
+
+func (p *PerTokenPass) Delete(ctx context.Context, docID string) error {
+	return p.pool.Delete(ctx, docID)
+}
+
+func (p *PerTokenPass) Stamps(ctx context.Context) (map[string]store.DocStamp, error) {
+	return p.pool.Stamps(ctx)
+}
 
 func (p *PerTokenPass) Ingest(ctx context.Context, docs []core.Document) error {
 	for _, d := range docs {

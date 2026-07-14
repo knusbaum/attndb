@@ -8,17 +8,25 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"sync"
 
 	"github.com/kjn/attndb/internal/core"
 	"github.com/kjn/attndb/internal/heat"
 	"github.com/kjn/attndb/internal/pass"
+	"github.com/kjn/attndb/internal/store"
 )
 
 // DB is a multi-pass database.
 type DB struct {
-	passes       []pass.Pass
-	norm         heat.Normalizer            // default normalizer (per-query min-max)
-	passNorm     map[string]heat.Normalizer // per-pass override (calibrated affine)
+	passes []pass.Pass
+	norm   heat.Normalizer // default normalizer (per-query min-max)
+
+	// passNorm is the per-pass calibrated override. It is swapped wholesale by
+	// SetCalibration (e.g. a background recalibration in the live server) while
+	// Search reads it concurrently, so both go through normMu.
+	normMu   sync.RWMutex
+	passNorm map[string]heat.Normalizer
+
 	recallK      int
 	peakFraction float64
 }
@@ -62,14 +70,20 @@ func New(passes []pass.Pass, opts ...Option) *DB {
 // SetCalibration installs calibrated affine normalizers per pass (replacing the
 // default per-query min-max for those passes).
 func (d *DB) SetCalibration(c Calibration) {
-	d.passNorm = make(map[string]heat.Normalizer, len(c))
+	m := make(map[string]heat.Normalizer, len(c))
 	for name, pc := range c {
-		d.passNorm[name] = heat.Affine{Lo: pc.Lo, Hi: pc.Hi}
+		m[name] = heat.Affine{Lo: pc.Lo, Hi: pc.Hi}
 	}
+	d.normMu.Lock()
+	d.passNorm = m // atomic swap: never mutate the live map in place
+	d.normMu.Unlock()
 }
 
 func (d *DB) normalizerFor(pass string) heat.Normalizer {
-	if n, ok := d.passNorm[pass]; ok {
+	d.normMu.RLock()
+	n, ok := d.passNorm[pass]
+	d.normMu.RUnlock()
+	if ok {
 		return n
 	}
 	return d.norm
@@ -83,6 +97,36 @@ func (d *DB) Ingest(ctx context.Context, docs []core.Document) error {
 		}
 	}
 	return nil
+}
+
+// Delete removes every record for the given documents from all passes. Combined
+// with Ingest it re-indexes a changed file (Delete then Ingest); alone it drops
+// a deleted one. Point IDs are span-derived, so a bare re-Ingest would orphan
+// the old version's spans — always Delete first when a document's text changed.
+func (d *DB) Delete(ctx context.Context, docIDs []string) error {
+	for _, p := range d.passes {
+		for _, id := range docIDs {
+			if err := p.Delete(ctx, id); err != nil {
+				return fmt.Errorf("delete pass %s (doc %s): %w", p.Name(), id, err)
+			}
+		}
+	}
+	return nil
+}
+
+// Stamps returns the index-of-record for change detection: per doc_id, the
+// mtime/sha recorded at ingest. It reads from the whole-doc pass ("doc") when
+// present — one point per doc, the cheapest to scroll — else the first pass.
+// All of a doc's points carry the same stamp, so the choice only affects cost.
+func (d *DB) Stamps(ctx context.Context) (map[string]store.DocStamp, error) {
+	src := d.passes[0]
+	for _, p := range d.passes {
+		if p.Name() == "doc" {
+			src = p
+			break
+		}
+	}
+	return src.Stamps(ctx)
 }
 
 // Search collects deposits from every pass, normalizes per pass, accumulates the
