@@ -90,23 +90,35 @@ exported weights and would rather skip it, uncomment the models bind mount in
 | `ATTNDB_PORT` | `8765` | host port for the MCP endpoint |
 | `ATTNDB_NS` | `vault` | collection namespace |
 
-The image is multi-arch (`linux/amd64` + `linux/arm64`): native libraries are
-fetched per `TARGETARCH` at build time. Building for your own architecture is
-just `docker compose build`. Building for the *other* one needs two things —
-emulation, and a builder that can produce it:
+The image is multi-arch (`linux/amd64` + `linux/arm64`), and **no emulation is
+needed to build it**. Native libraries are fetched per `TARGETARCH`, and the Go
+and Python stages both run on the *build* machine: Go cross-compiles with a
+Debian cross toolchain, and the model export emits architecture-independent ONNX.
+Nothing foreign is executed during a build — it is only written.
 
 ```
-# one-time: register qemu emulation for foreign architectures (privileged)
-docker run --privileged --rm tonistiigi/binfmt --install arm64
-
-# a single foreign-arch image works on the default builder
-docker buildx build --platform linux/arm64 -t attndb:arm64 .
+# a foreign-arch image builds on the default builder, no qemu required
+docker buildx build --platform linux/arm64 -t attndb:arm64 --load .
 
 # both at once needs the container driver — the default `docker` driver
 # cannot export a multi-platform manifest list
 docker buildx create --use --name attndb-builder
-docker buildx build --platform linux/amd64,linux/arm64 -t attndb .
+docker buildx build --platform linux/amd64,linux/arm64 -t <registry>/attndb:v1 --push .
 ```
+
+You only need qemu/binfmt to **run** a foreign-arch image locally
+(`docker run --platform linux/arm64 …`), never to build one:
+
+```
+docker run --privileged --rm tonistiigi/binfmt --install arm64
+```
+
+Cross-compiling rather than emulating is a correctness choice as much as a speed
+one. Building Go under qemu-user is unreliable — the toolchain drives parallel
+`compile` subprocesses through raw clone/futex/signals, and emulating that races:
+observed here as every child exiting into a zombie while the parent spun at 100%
+CPU, livelocked past 26 minutes, after an identical earlier build had happened to
+succeed in 149s. Cross-compiled, the same step takes ~11s.
 
 Once it is up, point your MCP client at `http://localhost:8765` — see
 [Connecting a client](#connecting-a-client).

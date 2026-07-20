@@ -73,22 +73,48 @@ RUN set -eux; \
     done
 
 # ---------- build ----------
-FROM golang:${GO_VERSION}-${DEBIAN_SUITE} AS build
+# Also pinned to BUILDPLATFORM: the Go toolchain runs natively and cross-compiles
+# to TARGETARCH, rather than running an arm64 toolchain under emulation.
+#
+# This is not just a speed choice. Building Go under qemu-user is unreliable: the
+# toolchain drives parallel `compile` subprocesses with raw clone/futex/signals,
+# and emulating that races. Observed here on an amd64 host targeting arm64 — every
+# `compile` child exited into a zombie while the parent spun at 100% CPU waiting
+# to reap them, livelocked past 26 minutes, after an identical earlier build had
+# happened to succeed in 149s. Cross-compiling removes the emulator from the build
+# entirely: nothing arm64 executes, it only gets written.
+#
+# Consequence worth knowing: binfmt/qemu is then only needed to *run* a foreign
+# image locally, never to build one.
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-${DEBIAN_SUITE} AS build
 ARG ORT_VERSION
 ARG TOKENIZERS_VERSION
 ARG TARGETARCH
+ARG BUILDARCH
 WORKDIR /src
 
-# Native deps. libtokenizers is a static archive linked at build time;
-# ONNX Runtime is a shared library dlopen'd at run time. Both name their release
-# assets by architecture, and the two projects spell it differently
-# (amd64/x64, arm64/aarch64) — hence the mapping.
+# Native deps + a cross C toolchain when the target differs from the builder.
+# libtokenizers is a static archive linked at build time; ONNX Runtime is a
+# shared library dlopen'd at run time (so it is never linked, only shipped).
+# Both projects name their release assets by architecture and spell it
+# differently (amd64/x64, arm64/aarch64) — hence the mapping.
 RUN set -eux; \
     case "$TARGETARCH" in \
-      amd64) ort_arch=x64;     tok_arch=amd64 ;; \
-      arm64) ort_arch=aarch64; tok_arch=arm64 ;; \
+      amd64) ort_arch=x64;     tok_arch=amd64; \
+             cross_pkgs="gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libc6-dev-amd64-cross" ;; \
+      arm64) ort_arch=aarch64; tok_arch=arm64; \
+             cross_pkgs="gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross" ;; \
       *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
     esac; \
+    if [ "$TARGETARCH" != "$BUILDARCH" ]; then \
+      apt-get update; \
+      : "All three are required. gcc-*-cross alone has no target headers, so cgo \
+         falls back to the host /usr/include and dies on arch-specific ones like \
+         bits/wordsize.h; libc6-dev-*-cross supplies those. g++-*-cross supplies \
+         the target libstdc++ that the ONNX Runtime bindings link (-lstdc++)."; \
+      apt-get install -y --no-install-recommends $cross_pkgs; \
+      rm -rf /var/lib/apt/lists/*; \
+    fi; \
     mkdir -p /out/libs; \
     curl -sSL "https://github.com/daulet/tokenizers/releases/download/v${TOKENIZERS_VERSION}/libtokenizers.linux-${tok_arch}.tar.gz" \
       | tar -xz -C /out/libs; \
@@ -104,8 +130,19 @@ RUN go mod download
 
 COPY . .
 # The onnx build tag pulls in the real encoders (CGO: ONNX Runtime + tokenizers).
-RUN CGO_ENABLED=1 CGO_LDFLAGS="-L/out/libs" \
-    go build -tags onnx -trimpath -o /out/attndb ./cmd/attndb
+# CC is the cross compiler when targeting another architecture, plain gcc when
+# building for this one.
+RUN set -eux; \
+    cc=gcc; cxx=g++; \
+    if [ "$TARGETARCH" != "$BUILDARCH" ]; then \
+      case "$TARGETARCH" in \
+        amd64) cc=x86_64-linux-gnu-gcc;  cxx=x86_64-linux-gnu-g++ ;; \
+        arm64) cc=aarch64-linux-gnu-gcc; cxx=aarch64-linux-gnu-g++ ;; \
+      esac; \
+    fi; \
+    CGO_ENABLED=1 GOOS=linux GOARCH="$TARGETARCH" CC="$cc" CXX="$cxx" \
+      CGO_LDFLAGS="-L/out/libs" \
+      go build -tags onnx -trimpath -o /out/attndb ./cmd/attndb
 
 # ---------- runtime ----------
 FROM debian:${DEBIAN_SUITE}-slim
