@@ -108,6 +108,9 @@ docker buildx create --use --name attndb-builder
 docker buildx build --platform linux/amd64,linux/arm64 -t attndb .
 ```
 
+Once it is up, point your MCP client at `http://localhost:8765` — see
+[Connecting a client](#connecting-a-client).
+
 One behavioral difference from running natively: a Linux container has **no
 FSEvents**, so change detection falls back to the portable poller
 (`ATTNDB_POLL`, default 30s) with `ATTNDB_RESYNC` as the bulk-operation
@@ -240,6 +243,32 @@ sub-seconds, and each query is tens of ms.
 
 Design notes: `docs/live-vault-index.md`. Namespaces (`-ns`) isolate independent
 indexes in one Qdrant (e.g. a vault vs. the sample corpus).
+
+### Connecting a client
+
+The daemon speaks MCP over **Streamable HTTP** at the root path, so the endpoint
+is just the listen address — `http://localhost:8765`, no `/mcp` suffix.
+
+**Claude Code.** Register it once for every project (`--scope user` is the
+global one; `local` is private to the current project, `project` is shared via
+a committed `.mcp.json`):
+
+```
+claude mcp add --transport http attndb http://localhost:8765 --scope user
+claude mcp list        # attndb: http://localhost:8765 (HTTP) - ✔ Connected
+```
+
+Then `/mcp` inside a session shows the tools, and `claude mcp remove attndb -s
+user` undoes it.
+
+**Claude Desktop / other clients.** Point them at the same URL. For clients that
+only speak stdio, bridge with `npx mcp-remote http://localhost:8765`.
+
+The server has no auth, so keep it bound to `localhost` (the default outside
+Docker). The compose setup publishes the port on the host — do not expose it to
+an untrusted network as-is: the write tools (`write_doc`, `edit_doc`,
+`delete_doc`) modify the vault. Reverse-proxy TLS + token auth is the M2 item
+tracked in `docs/proposal-multi-user.md`.
 
 ## Guiding an LLM to use the vault
 
