@@ -54,11 +54,50 @@ Default config (`cmd/attndb`): `tok-section` (per-token, section-aligned) +
 ## Running with Qdrant
 
 ```
-docker compose up -d                      # starts Qdrant (gRPC :6334, REST :6333)
+docker compose up -d qdrant               # starts Qdrant (gRPC :6334, REST :6333)
 go run ./cmd/attndb -store qdrant -k 3 "retry backoff when the service is unavailable"
 ```
 
-`-store memory` (default) needs no server and is what the tests use.
+`-store memory` (default) needs no server and is what the tests use. To bring up
+the whole thing — Qdrant *and* the document-serving MCP endpoint — see
+[Docker](#docker-the-whole-stack) below.
+
+## Docker: the whole stack
+
+`docker compose up -d` runs Qdrant plus the `serve` daemon, giving you an MCP
+endpoint on `http://localhost:8765` that indexes a directory and keeps it in
+sync. Paths are parameters, so the indexed document tree is configured exactly
+the way Qdrant's storage is:
+
+```
+# export the models first — they are mounted, not baked into the image
+cp .env.example .env        # then set ATTNDB_DOCS to your vault
+docker compose up -d
+docker compose logs -f attndb
+```
+
+| Variable | Default | What it is |
+|---|---|---|
+| `ATTNDB_DOCS` | `./vault` | the document tree to index and serve (read-write) |
+| `ATTNDB_MODELS` | `./models` | exported ONNX weights, mounted read-only |
+| `ATTNDB_STATE` | `./attndb_state` | generated calibration, persisted across restarts |
+| `QDRANT_STORAGE` | `./qdrant_storage` | Qdrant's data directory |
+| `ATTNDB_PORT` | `8765` | host port for the MCP endpoint |
+| `ATTNDB_NS` | `vault` | collection namespace |
+
+The image is multi-arch (`linux/amd64` + `linux/arm64`); native libraries are
+fetched per `TARGETARCH` at build time. For both at once:
+
+```
+docker buildx build --platform linux/amd64,linux/arm64 -t attndb .
+```
+
+Two things worth knowing. The **models are mounted, not baked in** — the image
+stays ~150 MB and the ~1.3 GB of weights stay regenerable, but you must run the
+export step below before the first `up`. And a Linux container has **no
+FSEvents**, so change detection falls back to the portable poller
+(`ATTNDB_POLL`, default 30s) with `ATTNDB_RESYNC` as the bulk-operation
+backstop — edits show up in search within a poll interval rather than instantly.
 
 ### Calibration & the relevance gate
 
@@ -237,6 +276,7 @@ it. See `docs/proposal-knowledge-capture.md`.
 - [x] Recursive ingest (subdirectories; relative-path doc IDs)
 - [x] Live index daemon: file watcher + reconciler + incremental (re-)index, lazy recalibration
 - [x] `search_vault` over MCP (Streamable HTTP), calibrated relevance gate
+- [x] Docker image + compose: `up` gives a document-serving MCP endpoint (multi-arch amd64/arm64)
 - [ ] Encoder batching (currently one forward pass per text)
 - [ ] Token-level sub-span refinement over Qdrant (store offsets in payload, read vectors back)
 - [ ] Eval / bake-off harness sweeping pass configurations

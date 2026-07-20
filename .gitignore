@@ -10,6 +10,12 @@
 # Local Qdrant storage
 /qdrant_storage/
 
+# Compose state: generated calibration + the default vault mount point. The
+# .env.example file IS committed; .env (machine paths) is not.
+/attndb_state/
+/vault/
+/.env
+
 # Generated calibration (produced by `ingest`/`serve`, tied to a specific
 # corpus/namespace — may reflect private content; never commit)
 /.attndb-*calibration.json

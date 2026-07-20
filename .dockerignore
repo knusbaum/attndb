@@ -1,0 +1,23 @@
+# Keep the build context small and hermetic. models/ alone is ~1.3 GB and is
+# mounted into the container at run time (see docker-compose.yml), never baked
+# into the image; libs/ is re-fetched inside the builder for the target arch.
+/models/
+/libs/
+/attndb
+/qdrant_storage/
+/attndb_state/
+/vault/
+/corpus/
+/corpus_milou/
+/.attndb-*calibration.json
+
+# Python export env — not used by the Go build
+/Pipfile
+/Pipfile.lock
+/.venv/
+__pycache__/
+
+/.git/
+/.github/
+/.claude/
+/Makefile.local

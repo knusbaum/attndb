@@ -1,6 +1,13 @@
-# Local Qdrant for attndb. Bring it up with:
+# attndb: a document-serving MCP endpoint backed by Qdrant.
+#
+#   cp .env.example .env     # then point ATTNDB_DOCS at your vault
 #   docker compose up -d
-# REST/dashboard: http://localhost:6333/dashboard   gRPC (Go client): localhost:6334
+#
+# MCP (Streamable HTTP): http://localhost:8765
+# Qdrant REST/dashboard:  http://localhost:6333/dashboard   gRPC: localhost:6334
+#
+# Paths are parameters (see .env.example): ATTNDB_DOCS is the indexed document
+# directory, exactly as QDRANT_STORAGE is where Qdrant keeps its data.
 services:
   qdrant:
     image: qdrant/qdrant:latest # pin to a specific version (e.g. :v1.16.1) for reproducibility
@@ -10,7 +17,54 @@ services:
       - "6333:6333" # REST + web dashboard
       - "6334:6334" # gRPC — used by github.com/qdrant/go-client
     volumes:
-      - ./qdrant_storage:/qdrant/storage
+      - ${QDRANT_STORAGE:-./qdrant_storage}:/qdrant/storage
     environment:
       QDRANT__SERVICE__GRPC_PORT: "6334"
       QDRANT__LOG_LEVEL: "INFO"
+    healthcheck:
+      # The image is distroless (no curl/wget), but it ships the qdrant binary's
+      # own TCP listener — check the gRPC port is accepting connections.
+      test: ["CMD", "/qdrant/qdrant", "--version"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  attndb:
+    build:
+      context: .
+      args:
+        ORT_VERSION: "1.27.0"
+    image: attndb:latest
+    container_name: attndb
+    restart: unless-stopped
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    ports:
+      - "${ATTNDB_PORT:-8765}:8765"
+    volumes:
+      # The indexed document tree. Read-write: the write_doc/edit_doc/delete_doc
+      # MCP tools modify it, and the watcher re-indexes a beat later.
+      - ${ATTNDB_DOCS:-./vault}:/vault
+      # Exported ONNX weights (~1.3 GB). Read-only, and mounted rather than baked
+      # into the image so it stays small and the weights stay regenerable.
+      - ${ATTNDB_MODELS:-./models}:/models:ro
+      # Generated calibration, so it survives restarts instead of being recomputed.
+      - ${ATTNDB_STATE:-./attndb_state}:/state
+    command:
+      - serve
+      - -store=qdrant
+      - -qdrant=qdrant:6334
+      - -encoder=onnx
+      - -provider=cpu
+      - -docs=/vault
+      - -model=/models
+      - -calib=/state/calibration.json
+      - -addr=0.0.0.0:8765
+      - -ns=${ATTNDB_NS:-vault}
+      # No FSEvents in a Linux container, so the portable poller drives change
+      # detection; -resync is the bulk-operation backstop.
+      - -poll=${ATTNDB_POLL:-30s}
+      - -resync=${ATTNDB_RESYNC:-5m}
+      - -min=${ATTNDB_MIN:-0}
