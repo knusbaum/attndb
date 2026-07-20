@@ -85,10 +85,21 @@ docker compose logs -f attndb
 | `ATTNDB_PORT` | `8765` | host port for the MCP endpoint |
 | `ATTNDB_NS` | `vault` | collection namespace |
 
-The image is multi-arch (`linux/amd64` + `linux/arm64`); native libraries are
-fetched per `TARGETARCH` at build time. For both at once:
+The image is multi-arch (`linux/amd64` + `linux/arm64`): native libraries are
+fetched per `TARGETARCH` at build time. Building for your own architecture is
+just `docker compose build`. Building for the *other* one needs two things —
+emulation, and a builder that can produce it:
 
 ```
+# one-time: register qemu emulation for foreign architectures (privileged)
+docker run --privileged --rm tonistiigi/binfmt --install arm64
+
+# a single foreign-arch image works on the default builder
+docker buildx build --platform linux/arm64 -t attndb:arm64 .
+
+# both at once needs the container driver — the default `docker` driver
+# cannot export a multi-platform manifest list
+docker buildx create --use --name attndb-builder
 docker buildx build --platform linux/amd64,linux/arm64 -t attndb .
 ```
 
