@@ -237,9 +237,17 @@ sub-seconds, and each query is tens of ms.
   re-ingest unchanged files.
 - **Calibration** is refreshed lazily as the corpus drifts (idle debounce +
   churn ceiling), recomputed in the background and swapped in atomically.
-- **Tool:** `search_vault(query, k?, min?)` → ranked `{path, span, score,
-  snippet}`; snippets are read fresh from disk. `min` exposes the calibrated
-  relevance gate so a consumer can tell "no confident match" from "weak hits".
+- **Tools.** `search_vault(query, k?, min?)` → ranked `{path, start_line,
+  end_line, score, snippet}`; snippets are read fresh from disk. `min` exposes
+  the calibrated relevance gate so a consumer can tell "no confident match" from
+  "weak hits". Alongside it, a filesystem set over the same vault:
+  `read_doc(path, offset?, limit?)`, `write_doc(path, content, append?)`,
+  `edit_doc(path, old_string, new_string, replace_all?)`, and
+  `delete_doc(path)` — all confined to the tree by `os.Root`.
+- **Reads are verbatim.** `read_doc` returns the file's bytes and reports the
+  line range separately (`start_line`/`end_line`/`total_lines`), so text you read
+  can go straight back into `edit_doc` as `old_string`. To grow a document, use
+  `write_doc` with `append` rather than a read-modify-write round trip.
 
 Design notes: `docs/live-vault-index.md`. Namespaces (`-ns`) isolate independent
 indexes in one Qdrant (e.g. a vault vs. the sample corpus).

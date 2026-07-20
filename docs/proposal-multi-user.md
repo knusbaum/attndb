@@ -55,17 +55,27 @@ shape of the host Read/Write/Edit tools (so an LLM already fluent in those uses
 them well); paths are **absolute within the vault** (`/` = the vault root) and
 confined via Go's `os.Root`:
 
-- **`write_doc(path, content)`** — create/overwrite a file in the watched tree.
-  Indexing follows automatically via the watcher; the tool does not ingest
-  directly.
+- **`write_doc(path, content, append?)`** — create/overwrite a file in the watched
+  tree, or with `append` add to its end (creating it if absent). Indexing follows
+  automatically via the watcher; the tool does not ingest directly.
 - **`edit_doc(path, old_string, new_string, replace_all?)`** — exact-string
   replacement, for updating part of a file without rewriting it (the capture
   loop's update-in-place path).
 - **`delete_doc(path)`** — remove a file from the tree (watcher drops it).
-- **`read_doc(path, offset?, limit?)`** — read a file's text back, line-numbered
-  and paged (default 2000 lines). Complements `search_vault`, which returns
+- **`read_doc(path, offset?, limit?)`** — read a file's text back **verbatim**,
+  paged (default 2000 lines), with the line range reported out-of-band as
+  `start_line`/`end_line`/`total_lines`. Complements `search_vault`, which returns
   `path` + line range: the search→read-context chain becomes two tools instead of
   requiring host filesystem access.
+
+*Note — `read_doc` returns bytes, not a rendering.* It originally prefixed each
+line with its number, mirroring the host `Read` tool. That made every
+read→edit round trip fail: `old_string` built from the output contained
+prefixes that were not in the file. The host pair gets away with it because the
+harness is stateful and enforces read-before-edit; MCP tools are stateless, so
+the convention is only prose. Position belongs in the metadata, never mixed into
+content that is also the write path. Growing a document uses `append`, not a
+read-modify-write round trip.
 
 Because these are just filesystem operations, the server owns no new storage
 model and snippets keep reading from the same on-disk copy. The design keeps one

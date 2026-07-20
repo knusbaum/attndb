@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -81,8 +82,10 @@ func TestFSToolsRoundTrip(t *testing.T) {
 	if out.TotalLines != 3 {
 		t.Errorf("total_lines = %d, want 3", out.TotalLines)
 	}
-	if !strings.Contains(out.Content, "\tline1\n") || !strings.Contains(out.Content, "\tline3\n") {
-		t.Errorf("read content not line-numbered as expected:\n%s", out.Content)
+	// Verbatim: exactly the bytes on disk, no line-number prefixes, so the text
+	// can go straight back into edit_doc.
+	if out.Content != "line1\nline2\nline3\n" {
+		t.Errorf("read content not verbatim: %q", out.Content)
 	}
 
 	_, eout, err := svc.editDoc(ctx, nil, editDocInput{
@@ -112,7 +115,7 @@ func TestReadDocPaging(t *testing.T) {
 	ctx := context.Background()
 	var sb strings.Builder
 	for i := 1; i <= 10; i++ {
-		sb.WriteString("row\n")
+		fmt.Fprintf(&sb, "row%d\n", i)
 	}
 	if _, _, err := svc.writeDoc(ctx, nil, writeDocInput{Path: "/big.md", Content: sb.String()}); err != nil {
 		t.Fatal(err)
@@ -124,8 +127,85 @@ func TestReadDocPaging(t *testing.T) {
 	if out.StartLine != 4 || out.EndLine != 6 || out.TotalLines != 10 {
 		t.Errorf("paging window = [%d,%d] of %d, want [4,6] of 10", out.StartLine, out.EndLine, out.TotalLines)
 	}
-	if !strings.Contains(out.Content, "     4\t") || strings.Contains(out.Content, "     7\t") {
-		t.Errorf("window content wrong:\n%s", out.Content)
+	// The window is the verbatim slice — position comes from the metadata above,
+	// never from prefixes baked into the text.
+	if out.Content != "row4\nrow5\nrow6\n" {
+		t.Errorf("window content = %q, want %q", out.Content, "row4\nrow5\nrow6\n")
+	}
+}
+
+// TestReadEditRoundTrip is the regression test for the line-number footgun:
+// text returned by read_doc must be usable as edit_doc's old_string with no
+// massaging. When read_doc prefixed each line with "%6d\t", every such edit
+// failed with "old_string not found" even though the text was visibly present.
+func TestReadEditRoundTrip(t *testing.T) {
+	svc := testVault(t)
+	ctx := context.Background()
+	const body = "# Log\n\n## 2026-07-20\n- did a thing\n"
+	if _, _, err := svc.writeDoc(ctx, nil, writeDocInput{Path: "/log.md", Content: body}); err != nil {
+		t.Fatal(err)
+	}
+	// Read a window, then feed exactly what came back straight into edit_doc.
+	_, out, err := svc.readDoc(ctx, nil, readDocInput{Path: "/log.md", Offset: 3, Limit: 2})
+	if err != nil {
+		t.Fatalf("readDoc: %v", err)
+	}
+	if _, eout, err := svc.editDoc(ctx, nil, editDocInput{
+		Path: "/log.md", OldString: out.Content, NewString: "## 2026-07-21\n- did another\n",
+	}); err != nil {
+		t.Fatalf("editDoc with verbatim read output: %v", err)
+	} else if eout.Replacements != 1 {
+		t.Errorf("replacements = %d, want 1", eout.Replacements)
+	}
+	b, _ := os.ReadFile(filepath.Join(svc.root, "log.md"))
+	if want := "# Log\n\n## 2026-07-21\n- did another\n"; string(b) != want {
+		t.Errorf("round-trip edit produced %q, want %q", b, want)
+	}
+}
+
+// TestWriteDocAppend covers the append path: it creates when absent, adds to the
+// end when present, and inserts a separating newline when the existing file does
+// not end with one (so an append never glues onto the last line).
+func TestWriteDocAppend(t *testing.T) {
+	svc := testVault(t)
+	ctx := context.Background()
+
+	// Creates the file when it does not exist.
+	if _, _, err := svc.writeDoc(ctx, nil, writeDocInput{
+		Path: "/daily/2026-07-20.md", Content: "# 2026-07-20\n", Append: true,
+	}); err != nil {
+		t.Fatalf("append-create: %v", err)
+	}
+	// Appends to the end, preserving what was there.
+	if _, _, err := svc.writeDoc(ctx, nil, writeDocInput{
+		Path: "/daily/2026-07-20.md", Content: "- entry one\n", Append: true,
+	}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	b, _ := os.ReadFile(filepath.Join(svc.root, "daily", "2026-07-20.md"))
+	if want := "# 2026-07-20\n- entry one\n"; string(b) != want {
+		t.Fatalf("append produced %q, want %q", b, want)
+	}
+
+	// A file not ending in a newline gets one inserted first.
+	if _, _, err := svc.writeDoc(ctx, nil, writeDocInput{Path: "/nonl.md", Content: "no newline"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := svc.writeDoc(ctx, nil, writeDocInput{Path: "/nonl.md", Content: "added\n", Append: true}); err != nil {
+		t.Fatalf("append to newline-less file: %v", err)
+	}
+	b, _ = os.ReadFile(filepath.Join(svc.root, "nonl.md"))
+	if want := "no newline\nadded\n"; string(b) != want {
+		t.Errorf("append to newline-less file produced %q, want %q", b, want)
+	}
+
+	// append=false still overwrites.
+	if _, _, err := svc.writeDoc(ctx, nil, writeDocInput{Path: "/nonl.md", Content: "replaced\n"}); err != nil {
+		t.Fatal(err)
+	}
+	b, _ = os.ReadFile(filepath.Join(svc.root, "nonl.md"))
+	if string(b) != "replaced\n" {
+		t.Errorf("overwrite produced %q, want %q", b, "replaced\n")
 	}
 }
 

@@ -52,9 +52,14 @@ about *what* to record matters more than the writing.
 
 Always `search_vault` the topic before writing. If a closely related note
 already exists:
-- `read_doc` it, then **update it in place** — `edit_doc` to merge/replace the
-  relevant section, or `write_doc` to the **same path** with merged content
-  (overwrite is fine; the index reconciles it).
+- `read_doc` it, then **update it in place**. Pick the narrowest tool that does
+  the job:
+  - **adding to the end** (a new finding, a dated entry) → `write_doc` with
+    `append: true`. No need to read the document back first.
+  - **changing a section** → `edit_doc`. `read_doc` returns text **verbatim**, so
+    paste what you read straight in as `old_string` — no stripping or reformatting.
+  - **restructuring the whole note** → `write_doc` to the **same path** with
+    merged content (overwrite is fine; the index reconciles it).
 - Only create a **new** file when nothing close exists.
 
 Semantic dedup is never perfect; the dedicated `Research/` folder (below) is the

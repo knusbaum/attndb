@@ -53,8 +53,9 @@ transient conversational back-and-forth.
 
 ## Reading the results — the important part
 
-Results are **spans**, not whole documents: each hit is a file path, a byte
-range, a **calibrated** score, and a text snippet.
+Results are **spans**, not whole documents: each hit is a file path, the line
+range it matched (`start_line`/`end_line`), a **calibrated** score, and a text
+snippet.
 
 - **Scores are calibrated.** A **low top score means there is no confident
   match.** When that happens, say "I didn't find anything relevant in your vault"
@@ -65,16 +66,16 @@ range, a **calibrated** score, and a text snippet.
 ## Chaining to full context
 
 A snippet is a fragment. For real synthesis — summarizing a note, quoting
-accurately, understanding surrounding context — **open the cited file** (the
-`path` is vault-relative; read it with your normal file-reading tool) rather than
-answering from the snippet alone.
+accurately, understanding surrounding context — **open the cited file** rather
+than answering from the snippet alone.
 
-> A dedicated `retrieve_doc` tool (read a vault file without host filesystem
-> access) is planned so this works for MCP clients that can't read the disk
-> directly. Until then, in a host with filesystem access, just read the path.
+Use **`read_doc`** with the hit's `path`, passing its `start_line` as `offset` to
+land on the matched region. It needs no host filesystem access, so it works from
+any MCP client. It returns text **verbatim** and reports the range separately as
+`start_line`/`end_line`/`total_lines` — so if you go on to change the document,
+what you read can be handed straight to `edit_doc` as `old_string`.
 
 ## Always cite
 
-Cite the **path** (and byte span when precision matters) for anything you draw
-from the vault, so the user can open the source and verify. Grounded-and-cited
-beats confident-and-vague.
+Cite the **path** and line for anything you draw from the vault, so the user can
+open the source and verify. Grounded-and-cited beats confident-and-vague.

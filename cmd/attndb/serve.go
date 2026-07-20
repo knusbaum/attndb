@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	_ "net/http/pprof" // registers /debug/pprof handlers on DefaultServeMux (served only when -debug-addr is set)
@@ -166,28 +167,32 @@ func runServe(args []string) error {
 	}, svc.search)
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "read_doc",
-		Description: "Read a document from the user's vault by its absolute vault path, returning its text " +
-			"with line numbers. Reads from line `offset` (default 1) for up to `limit` lines (default 2000); " +
-			"page through a large document by advancing `offset` instead of pulling it all into context. " +
-			"Pairs with search_vault, which gives you a path and start line to read around. Convention: read " +
-			"a document before editing it.",
+		Description: "Read a document from the user's vault by its absolute vault path. Returns the text " +
+			"verbatim — exactly the bytes in the file, with no line-number prefixes — so what you read can be " +
+			"passed straight back as edit_doc's `old_string`. The range you got is reported separately as " +
+			"`start_line`/`end_line`/`total_lines`. Reads from line `offset` (default 1) for up to `limit` " +
+			"lines (default 2000); page through a large document by advancing `offset` instead of pulling it " +
+			"all into context. Pairs with search_vault, which gives you a path and start line to read around. " +
+			"Convention: read a document before editing it.",
 	}, svc.readDoc)
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "write_doc",
 		Description: "Create or overwrite a markdown document in the user's vault at an absolute vault path, " +
 			"creating parent folders as needed. Use it to save durable notes or research so they become " +
-			"searchable later. A written document becomes searchable shortly after, not instantly — to " +
-			"confirm it landed, search again after a moment rather than expecting an immediate hit. For " +
-			"changing part of an existing document prefer edit_doc over rewriting the whole thing. Paths " +
-			"must be inside the vault and end in .md.",
+			"searchable later. Set `append` to add `content` to the end of the document instead of replacing " +
+			"it (creating it if absent) — the right way to grow a running log or add a section, since it " +
+			"needs no read-modify-write round trip. A written document becomes searchable shortly after, not " +
+			"instantly — to confirm it landed, search again after a moment rather than expecting an immediate " +
+			"hit. To change part of an existing document prefer edit_doc over rewriting the whole thing. " +
+			"Paths must be inside the vault and end in .md.",
 	}, svc.writeDoc)
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "edit_doc",
 		Description: "Edit a document in the user's vault by replacing an exact string. `old_string` must " +
-			"match the file exactly and be unique, unless `replace_all` is set. Prefer this over rewriting a " +
-			"whole document when you are updating part of it. Convention: read the document first, and strip " +
-			"the line-number prefix that read_doc adds before matching. Paths must be inside the vault and " +
-			"end in .md.",
+			"match the file exactly and be unique, unless `replace_all` is set. read_doc returns text " +
+			"verbatim, so text you read can be used as `old_string` as-is. Prefer this over rewriting a " +
+			"whole document when you are updating part of it; to add to the end of a document, use write_doc " +
+			"with `append`. Convention: read the document first. Paths must be inside the vault and end in .md.",
 	}, svc.editDoc)
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "delete_doc",
@@ -472,7 +477,7 @@ type readDocInput struct {
 }
 type readDocOutput struct {
 	Path       string `json:"path" jsonschema:"the absolute vault path read"`
-	Content    string `json:"content" jsonschema:"the requested lines, each prefixed with its line number"`
+	Content    string `json:"content" jsonschema:"the requested lines, verbatim — exactly the bytes in the file, safe to pass back to edit_doc"`
 	StartLine  int    `json:"start_line" jsonschema:"1-based line of the first returned line"`
 	EndLine    int    `json:"end_line" jsonschema:"1-based line of the last returned line"`
 	TotalLines int    `json:"total_lines" jsonschema:"total number of lines in the document"`
@@ -489,9 +494,12 @@ func (s *vaultService) readDoc(_ context.Context, _ *mcp.CallToolRequest, in rea
 	}
 	lines := strings.Split(string(b), "\n")
 	// A trailing newline yields a final empty element; drop it so line counts
-	// match what an editor shows.
+	// match what an editor shows. Remember whether it was there so the slice we
+	// return can be reassembled byte-for-byte.
+	trailingNL := false
 	if n := len(lines); n > 0 && lines[n-1] == "" {
 		lines = lines[:n-1]
+		trailingNL = true
 	}
 	total := len(lines)
 
@@ -511,18 +519,29 @@ func (s *vaultService) readDoc(_ context.Context, _ *mcp.CallToolRequest, in rea
 		end = total
 	}
 
-	var b2 strings.Builder
-	for i := start; i <= end; i++ {
-		fmt.Fprintf(&b2, "%6d\t%s\n", i, lines[i-1])
+	// Verbatim: the returned text is exactly the bytes on disk for [start,end],
+	// so it can be passed straight back as edit_doc's old_string or spliced into
+	// write_doc without any un-prefixing. Position is reported out-of-band in
+	// StartLine/EndLine/TotalLines — never mixed into the content, which would
+	// make every read a corrupting round trip.
+	var content string
+	if start <= end {
+		content = strings.Join(lines[start-1:end], "\n")
+		// Re-attach the newline that Split consumed: there is one after the last
+		// returned line whenever another line follows it, or when the file itself
+		// ended with a newline.
+		if end < total || trailingNL {
+			content += "\n"
+		}
 	}
-	content := b2.String()
 	out := readDocOutput{Path: in.Path, Content: content, StartLine: start, EndLine: end, TotalLines: total}
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: content}}}, out, nil
 }
 
 type writeDocInput struct {
 	Path    string `json:"path" jsonschema:"absolute vault path of the .md document, e.g. /Research/2026-07-14-topic.md"`
-	Content string `json:"content" jsonschema:"full markdown content of the document"`
+	Content string `json:"content" jsonschema:"markdown content: the whole document, or the fragment to add when append is true"`
+	Append  bool   `json:"append,omitempty" jsonschema:"append content to the end of the document instead of overwriting it, creating it if absent"`
 }
 type writeDocOutput struct {
 	Path string `json:"path" jsonschema:"the absolute vault path written"`
@@ -538,12 +557,47 @@ func (s *vaultService) writeDoc(_ context.Context, _ *mcp.CallToolRequest, in wr
 			return nil, writeDocOutput{}, err
 		}
 	}
-	if err := s.rootFS.WriteFile(name, []byte(in.Content), 0o644); err != nil {
+	verb := "Wrote"
+	if in.Append {
+		// Append exists so growing a document (a running log, a note you add to)
+		// doesn't require reading the whole thing back and rewriting it — a
+		// round trip that costs context and risks clobbering concurrent edits.
+		if err := s.appendFile(name, in.Content); err != nil {
+			return nil, writeDocOutput{}, err
+		}
+		verb = "Appended to"
+	} else if err := s.rootFS.WriteFile(name, []byte(in.Content), 0o644); err != nil {
 		return nil, writeDocOutput{}, err
 	}
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{
-		Text: fmt.Sprintf("Wrote %s (searchable shortly)", in.Path),
+		Text: fmt.Sprintf("%s %s (searchable shortly)", verb, in.Path),
 	}}}, writeDocOutput{Path: in.Path}, nil
+}
+
+// appendFile adds content to the end of name, creating it if absent. It inserts
+// a newline first when the existing file does not end with one, so an append
+// never silently glues itself onto the last line.
+func (s *vaultService) appendFile(name, content string) error {
+	f, err := s.rootFS.OpenFile(name, os.O_RDWR|os.O_CREATE, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	end, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
+		return err
+	}
+	if end > 0 {
+		var last [1]byte
+		if _, err := f.ReadAt(last[:], end-1); err != nil {
+			return err
+		}
+		if last[0] != '\n' {
+			content = "\n" + content
+		}
+	}
+	_, err = f.Write([]byte(content))
+	return err
 }
 
 type editDocInput struct {
