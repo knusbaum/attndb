@@ -70,7 +70,7 @@ func TestReconcileAll(t *testing.T) {
 	write(t, filepath.Join(root, ".obsidian", "x.md"), "hidden") // hidden dir
 
 	fs := newFakeStore()
-	r := New(root, fs)
+	r := New(root, fs, nil)
 	ctx := context.Background()
 
 	n, err := r.ReconcileAll(ctx)
@@ -104,7 +104,7 @@ func TestReconcileAllDetectsBulkDeletion(t *testing.T) {
 	write(t, filepath.Join(root, "sub", "b.md"), "b")
 
 	fs := newFakeStore()
-	r := New(root, fs)
+	r := New(root, fs, nil)
 	ctx := context.Background()
 	r.ReconcileAll(ctx)
 	if len(fs.docs) != 3 {
@@ -133,7 +133,7 @@ func TestReconcileGranular(t *testing.T) {
 	write(t, apath, "alpha")
 
 	fs := newFakeStore()
-	r := New(root, fs)
+	r := New(root, fs, nil)
 	ctx := context.Background()
 	r.ReconcileAll(ctx) // seed: a.md indexed
 

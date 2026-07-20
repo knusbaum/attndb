@@ -55,7 +55,13 @@ func ensureEnv() error {
 			lib = defaultLibPath
 		}
 		ort.SetSharedLibraryPath(lib)
-		initErr = ort.InitializeEnvironment()
+		if initErr = ort.InitializeEnvironment(); initErr != nil {
+			return
+		}
+		// Register the mmap-backed CPU allocator. Sessions that opt in (see
+		// buildSessionOptions envAlloc) route large allocations through it so
+		// freed buffers are munmap'd back to the OS instead of pinned in libmalloc.
+		initErr = ort.RegisterMmapCpuAllocator()
 	})
 	return initErr
 }
@@ -66,10 +72,38 @@ func ensureEnv() error {
 // visible on stderr. It errors loud if the CoreML EP is not available in the
 // loaded dylib — callers must not silently fall back to CPU.
 // The caller is responsible for calling opts.Destroy() after the session is created.
-func buildSessionOptions(provider string) (*ort.SessionOptions, error) {
+func buildSessionOptions(provider string, envAlloc bool) (*ort.SessionOptions, error) {
 	opts, err := ort.NewSessionOptions()
 	if err != nil {
 		return nil, fmt.Errorf("session options: %w", err)
+	}
+	// Disable MLAS's KleidiAI GEMM backend. On Apple Silicon (ORT ≥1.26) the
+	// KleidiAI MatMul path allocates its GEMM working buffers with raw operator
+	// new/malloc — bypassing the OrtAllocator interface — and pools them past
+	// session lifetime, so each reconcile pass leaks ~14 GiB into libmalloc and
+	// the daemon grows unbounded (see docs/proposal-onnx-memory.md, "ROOT CAUSE
+	// FOUND"). Reverting to standard MLAS SGEMM keeps GEMM buffers bounded.
+	if err := opts.AddSessionConfigEntry("mlas.disable_kleidiai", "1"); err != nil {
+		opts.Destroy()
+		return nil, fmt.Errorf("disable kleidiai: %w", err)
+	}
+	// envAlloc routes this session's allocations through the env's registered
+	// mmap CPU allocator (see RegisterMmapCpuAllocator), so its large freed
+	// buffers are munmap'd back to the OS. Used for the ephemeral ingest session,
+	// whose big whole-doc encodes are the memory hog; the persistent query
+	// session leaves it off (ORT default arena). See docs/proposal-onnx-memory.md.
+	if envAlloc {
+		if err := opts.AddSessionConfigEntry("session.use_env_allocators", "1"); err != nil {
+			opts.Destroy()
+			return nil, fmt.Errorf("use_env_allocators: %w", err)
+		}
+		// Disable the per-session arena so allocations go straight to our
+		// registered device allocator (mmap/munmap). With the arena on, ORT would
+		// pool the buffers and our Free never runs until the pool is torn down.
+		if err := opts.SetCpuMemArena(false); err != nil {
+			opts.Destroy()
+			return nil, fmt.Errorf("disable arena for env alloc: %w", err)
+		}
 	}
 	if provider == "coreml" {
 		// Verbose logging exposes which nodes ORT assigns to CoreMLExecutionProvider
@@ -109,7 +143,7 @@ func NewColBERT(modelDir, provider string) (*ColBERT, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load tokenizer: %w", err)
 	}
-	opts, err := buildSessionOptions(provider)
+	opts, err := buildSessionOptions(provider, false) // ColBERT (300-token cap) isn't the memory hog
 	if err != nil {
 		tk.Close()
 		return nil, err
@@ -220,7 +254,7 @@ func (c *ColBERT) encode(text string, isDoc bool) (core.TokenVecs, error) {
 func (c *ColBERT) run(ids, mask []int64, fixedLen int) ([]float32, error) {
 	if fixedLen > len(ids) {
 		pad := make([]int64, fixedLen-len(ids))
-		ids = append(ids, pad...)  // pad token id 0 (ignored by attention)
+		ids = append(ids, pad...)   // pad token id 0 (ignored by attention)
 		mask = append(mask, pad...) // 0 = masked out
 	}
 	shape := ort.NewShape(1, int64(len(ids)))

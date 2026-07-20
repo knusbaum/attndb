@@ -15,9 +15,21 @@ func onnxEncoders(modelDir, provider string) (core.MultiVectorEncoder, core.Sing
 	if err != nil {
 		return nil, nil, err
 	}
-	sv, err := onnx.NewSingleVector(modelDir+"/single", provider)
+	sv, err := onnx.NewSingleVector(modelDir+"/single", provider, false) // query session: default allocator
 	if err != nil {
 		return nil, nil, err
 	}
 	return cb, sv, nil
+}
+
+// onnxSingleEncoder builds a standalone single-vector encoder plus a close func
+// that destroys its ONNX session and returns the native memory to the OS. Used
+// for the daemon's ephemeral per-reconcile ingest session — envAlloc=true so its
+// large buffers go through the mmap allocator and munmap back to the OS on Close.
+func onnxSingleEncoder(modelDir, provider string) (core.SingleVectorEncoder, func() error, error) {
+	sv, err := onnx.NewSingleVector(modelDir+"/single", provider, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	return sv, sv.Close, nil
 }

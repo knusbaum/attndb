@@ -5,6 +5,8 @@ package onnx
 import (
 	"context"
 	"fmt"
+	"os"
+	"strconv"
 	"sync"
 
 	"github.com/daulet/tokenizers"
@@ -15,9 +17,22 @@ import (
 // singleDim is the embedding dimension of gte-modernbert-base.
 const singleDim = 768
 
-// maxSingleLen caps the input length fed to the single-vector model (its native
-// max is 8192; whole-document chunks are truncated to a coarse gestalt).
-const maxSingleLen = 8192
+// maxSingleLen caps the input length fed to the single-vector model. Its native
+// max is 8192, but attention is O(n²), so a single whole-doc encode near the cap
+// has a multi-GB working set (≈9–17 GiB at 8192) that dominates the daemon's
+// memory high-water. Lower it to bound peak/steady memory (a smaller cap = a
+// coarser doc-level vector; the paragraph pass still carries fine detail).
+// Override with ATTNDB_MAX_SINGLE_LEN.
+var maxSingleLen = envInt("ATTNDB_MAX_SINGLE_LEN", 8192)
+
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
 
 // coreMlSingleLen is the fixed sequence length used in CoreML mode. CoreML
 // requires a static graph shape; 512 covers typical paragraph/section chunks
@@ -35,8 +50,10 @@ type SingleVector struct {
 }
 
 // NewSingleVector loads the model and tokenizer from modelDir (expects model.onnx
-// and tokenizer.json). provider is "cpu" or "coreml".
-func NewSingleVector(modelDir, provider string) (*SingleVector, error) {
+// and tokenizer.json). provider is "cpu" or "coreml". envAlloc routes the
+// session's allocations through the mmap CPU allocator (used for the ephemeral
+// ingest session so its large freed buffers return to the OS).
+func NewSingleVector(modelDir, provider string, envAlloc bool) (*SingleVector, error) {
 	if err := ensureEnv(); err != nil {
 		return nil, fmt.Errorf("onnx env: %w", err)
 	}
@@ -44,7 +61,7 @@ func NewSingleVector(modelDir, provider string) (*SingleVector, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load tokenizer: %w", err)
 	}
-	opts, err := buildSessionOptions(provider)
+	opts, err := buildSessionOptions(provider, envAlloc)
 	if err != nil {
 		tk.Close()
 		return nil, err

@@ -296,10 +296,16 @@ type tuning struct {
 	wTok, wPara, wDoc float64
 }
 
-func buildDB(multi core.MultiVectorEncoder, single core.SingleVectorEncoder, encKind, ns string, mk func(string) (store.Pool, error), t tuning) (*db.DB, error) {
-	// collection names are encoder-scoped so different encoders (and dims) don't
-	// collide in the same store. An optional namespace further isolates a corpus
-	// (e.g. the Obsidian vault) from the default shared collections.
+// dbPools are the three per-pass Qdrant collections. They are separated from DB
+// assembly so the serve daemon can share one set of pools between its persistent
+// query DB and the ephemeral per-reconcile ingest DB (which swaps in a fresh
+// single-vector session to bound memory — see docs/proposal-onnx-memory.md).
+type dbPools struct{ tok, para, doc store.Pool }
+
+// newPools creates the encoder- and namespace-scoped collections. Collection
+// names are encoder-scoped so different encoders (and dims) don't collide; an
+// optional namespace further isolates a corpus (e.g. the Obsidian vault).
+func newPools(encKind, ns string, mk func(string) (store.Pool, error)) (dbPools, error) {
 	prefix := "attndb"
 	if ns != "" {
 		prefix += "_" + ns
@@ -307,27 +313,53 @@ func buildDB(multi core.MultiVectorEncoder, single core.SingleVectorEncoder, enc
 	suffix := "_" + encKind
 	tokPool, err := mk(prefix + "_tok_section" + suffix)
 	if err != nil {
-		return nil, err
+		return dbPools{}, err
 	}
 	paraPool, err := mk(prefix + "_para" + suffix)
 	if err != nil {
-		return nil, err
+		return dbPools{}, err
 	}
 	docPool, err := mk(prefix + "_doc" + suffix)
 	if err != nil {
-		return nil, err
+		return dbPools{}, err
 	}
+	return dbPools{tok: tokPool, para: paraPool, doc: docPool}, nil
+}
+
+// assembleDB composes the passes over the given encoders and pools.
+func assembleDB(multi core.MultiVectorEncoder, single core.SingleVectorEncoder, p dbPools, t tuning) *db.DB {
 	passes := []pass.Pass{
 		// per-token core: section-aligned (kept under the model's 300-token doc cap)
-		pass.NewPerTokenPass("tok-section", chunk.BySection(200, 32), multi, tokPool, pass.WithWeight(t.wTok)),
+		pass.NewPerTokenPass("tok-section", chunk.BySection(200, 32), multi, p.tok, pass.WithWeight(t.wTok)),
 		// paragraph-level single-vector: diffuse-meaning deposits
-		pass.NewSingleVectorPass("para", chunk.ByParagraph(), single, paraPool, pass.WithWeight(t.wPara)),
+		pass.NewSingleVectorPass("para", chunk.ByParagraph(), single, p.para, pass.WithWeight(t.wPara)),
 		// document-level single-vector: a GENTLE whole-doc topical prior — kept
 		// low-weight so its flat deposit lifts the document without engulfing the
 		// localized peaks from the token/paragraph passes.
-		pass.NewSingleVectorPass("doc", chunk.WholeDoc(), single, docPool, pass.WithWeight(t.wDoc)),
+		pass.NewSingleVectorPass("doc", chunk.WholeDoc(), single, p.doc, pass.WithWeight(t.wDoc)),
 	}
-	return db.New(passes, db.WithRecallK(t.recallK), db.WithPeakFraction(t.peak)), nil
+	return db.New(passes, db.WithRecallK(t.recallK), db.WithPeakFraction(t.peak))
+}
+
+func buildDB(multi core.MultiVectorEncoder, single core.SingleVectorEncoder, encKind, ns string, mk func(string) (store.Pool, error), t tuning) (*db.DB, error) {
+	p, err := newPools(encKind, ns, mk)
+	if err != nil {
+		return nil, err
+	}
+	return assembleDB(multi, single, p, t), nil
+}
+
+// singleEncoder builds just a single-vector encoder plus a close func. Used by
+// the serve daemon to spin up an ephemeral ingest session per reconcile.
+func singleEncoder(kind string, dim int, modelDir, provider string) (core.SingleVectorEncoder, func() error, error) {
+	switch kind {
+	case "stub":
+		return encode.NewStubSingle(dim), func() error { return nil }, nil
+	case "onnx":
+		return onnxSingleEncoder(modelDir, provider)
+	default:
+		return nil, nil, fmt.Errorf("unknown -encoder %q (want stub|onnx)", kind)
+	}
 }
 
 func buildQuery(text, filter string) core.Query {

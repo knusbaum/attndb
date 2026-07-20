@@ -14,3 +14,7 @@ import (
 func onnxEncoders(modelDir, provider string) (core.MultiVectorEncoder, core.SingleVectorEncoder, error) {
 	return nil, nil, fmt.Errorf("onnx encoder not compiled in; rebuild with -tags onnx (and CGO_LDFLAGS=-L./libs)")
 }
+
+func onnxSingleEncoder(modelDir, provider string) (core.SingleVectorEncoder, func() error, error) {
+	return nil, nil, fmt.Errorf("onnx encoder not compiled in; rebuild with -tags onnx (and CGO_LDFLAGS=-L./libs)")
+}

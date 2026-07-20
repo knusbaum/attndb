@@ -29,18 +29,68 @@ type Store interface {
 	Stamps(ctx context.Context) (map[string]store.DocStamp, error)
 }
 
-// Reconciler diffs a directory tree against a Store and applies the changes.
-type Reconciler struct {
-	root  string
-	db    Store
-	mu    sync.Mutex                // single writer: serialize reconcile passes
-	known map[string]store.DocStamp // docID -> last-applied stamp (in-memory cache)
+// Ingester is an isolated indexing session used only for the (memory-heavy)
+// encode-and-upsert half of a reconcile pass. The serve daemon supplies one
+// backed by a fresh ONNX single-vector session per pass and Closes it when the
+// pass ends, so large-document encodes don't pin memory for the process
+// lifetime (see docs/proposal-onnx-memory.md). Deletes and stamp reads stay on
+// the persistent Store.
+type Ingester interface {
+	Ingest(ctx context.Context, docs []core.Document) error
+	Close() error
 }
 
-// New returns a Reconciler for root backed by db. Call ReconcileAll once before
-// serving to seed the in-memory stamp cache from the index.
-func New(root string, db Store) *Reconciler {
-	return &Reconciler{root: root, db: db, known: map[string]store.DocStamp{}}
+// Reconciler diffs a directory tree against a Store and applies the changes.
+type Reconciler struct {
+	root string
+	db   Store
+	// newIngester, if non-nil, builds a fresh per-pass Ingester for the upsert
+	// work (closed at pass end). Nil falls back to db.Ingest (e.g. one-shot CLI).
+	newIngester func() (Ingester, error)
+	mu          sync.Mutex                // single writer: serialize reconcile passes
+	known       map[string]store.DocStamp // docID -> last-applied stamp (in-memory cache)
+}
+
+// New returns a Reconciler for root backed by db. If newIngester is non-nil, the
+// upsert half of each pass runs through a fresh Ingester it builds (closed after
+// the pass); pass nil to ingest directly through db. Call ReconcileAll once
+// before serving to seed the in-memory stamp cache from the index.
+func New(root string, db Store, newIngester func() (Ingester, error)) *Reconciler {
+	return &Reconciler{root: root, db: db, newIngester: newIngester, known: map[string]store.DocStamp{}}
+}
+
+// ingestSession routes upserts either through a lazily-built per-pass Ingester
+// (which it closes at pass end) or, when no factory is configured, straight to
+// the Store.
+type ingestSession struct {
+	newIng   func() (Ingester, error)
+	fallback func(context.Context, []core.Document) error
+	ing      Ingester
+}
+
+func (r *Reconciler) beginIngest() *ingestSession {
+	return &ingestSession{newIng: r.newIngester, fallback: r.db.Ingest}
+}
+
+func (s *ingestSession) ingest(ctx context.Context, docs []core.Document) error {
+	if s.newIng == nil {
+		return s.fallback(ctx, docs)
+	}
+	if s.ing == nil {
+		ing, err := s.newIng()
+		if err != nil {
+			return err
+		}
+		s.ing = ing
+	}
+	return s.ing.Ingest(ctx, docs)
+}
+
+func (s *ingestSession) close() {
+	if s.ing != nil {
+		s.ing.Close()
+		s.ing = nil
+	}
 }
 
 // Count returns the number of documents currently tracked (indexed).
@@ -69,6 +119,9 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (int, error) {
 		}
 	}
 
+	ing := r.beginIngest() // fresh per-pass ingest session (built lazily on first upsert)
+	defer ing.close()
+
 	onDisk := make(map[string]core.Document, len(docs))
 	changed := 0
 	for _, d := range docs {
@@ -76,7 +129,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (int, error) {
 		if sameContent(r.stampOf(d), r.known[d.ID]) {
 			continue // unchanged
 		}
-		if err := r.applyUpsert(ctx, d); err != nil {
+		if err := r.applyUpsert(ctx, d, ing); err != nil {
 			return changed, err
 		}
 		changed++
@@ -99,6 +152,9 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (int, error) {
 func (r *Reconciler) Reconcile(ctx context.Context, paths []string) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	ing := r.beginIngest() // fresh per-pass ingest session (built lazily on first upsert)
+	defer ing.close()
 
 	changed := 0
 	for _, p := range paths {
@@ -124,7 +180,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, paths []string) (int, error)
 			if sameContent(r.stampOf(doc), r.known[id]) {
 				continue // content unchanged (e.g. a bare touch)
 			}
-			if err := r.applyUpsert(ctx, doc); err != nil {
+			if err := r.applyUpsert(ctx, doc, ing); err != nil {
 				return changed, err
 			}
 			changed++
@@ -133,13 +189,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, paths []string) (int, error)
 	return changed, nil
 }
 
-// applyUpsert deletes any prior version then ingests the new one, keeping the
-// cache in step. Caller holds r.mu.
-func (r *Reconciler) applyUpsert(ctx context.Context, d core.Document) error {
+// applyUpsert deletes any prior version then ingests the new one (through the
+// per-pass ingest session), keeping the cache in step. Caller holds r.mu.
+func (r *Reconciler) applyUpsert(ctx context.Context, d core.Document, ing *ingestSession) error {
 	if err := r.db.Delete(ctx, []string{d.ID}); err != nil {
 		return err
 	}
-	if err := r.db.Ingest(ctx, []core.Document{d}); err != nil {
+	if err := ing.ingest(ctx, []core.Document{d}); err != nil {
 		return err
 	}
 	r.known[d.ID] = r.stampOf(d)

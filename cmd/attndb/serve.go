@@ -6,9 +6,13 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	_ "net/http/pprof" // registers /debug/pprof handlers on DefaultServeMux (served only when -debug-addr is set)
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,6 +39,8 @@ func runServe(args []string) error {
 	floor := fs.Int("recal-floor", 5, "minimum changed docs before the idle debounce recalibrates (small edits ride the staleness cap)")
 	maxStale := fs.Duration("recal-max-stale", time.Hour, "recalibrate at most this often when any change is pending (staleness cap)")
 	defMin := fs.Float64("min", 0, "default relevance gate for search_vault (0 = no gate)")
+	debugAddr := fs.String("debug-addr", "", "if set, serve net/http/pprof + debug on this address (e.g. localhost:6060)")
+	memlog := fs.Duration("memlog", 5*time.Minute, "interval to log Go memstats + process RSS (0 disables); the rss-minus-Go-heap gap is native/ONNX memory")
 	fs.Parse(args)
 
 	if *c.store != "qdrant" {
@@ -61,17 +67,44 @@ func runServe(args []string) error {
 	defer rootFS.Close()
 	ctx := context.Background()
 
-	database, err := c.database()
+	// Build the query DB explicitly (rather than c.database()) so the memory-heavy
+	// ingest path can reuse the shared pools and ColBERT encoder while swapping in
+	// a fresh, ephemeral single-vector session per reconcile. The query session
+	// (in `database`) only ever encodes short queries and stays small; large
+	// document encodes live in the ephemeral ingest session, which is closed after
+	// each pass so its memory returns to the OS. See docs/proposal-onnx-memory.md.
+	mk, err := poolFactory(*c.store, *c.qaddr)
 	if err != nil {
 		return err
 	}
+	multi, querySingle, err := encoders(*c.encoder, *c.dim, *c.model, *c.provider)
+	if err != nil {
+		return err
+	}
+	pools, err := newPools(*c.encoder, *c.ns, mk)
+	if err != nil {
+		return err
+	}
+	t := tuning{recallK: *c.recallK, peak: *c.peak, wTok: *c.wTok, wPara: *c.wPara, wDoc: *c.wDoc}
+	database := assembleDB(multi, querySingle, pools, t)
+
 	if calib, err := loadCalibration(*c.calib, *c.encoder); err != nil {
 		return err
 	} else if calib != nil {
 		database.SetCalibration(calib)
 	}
 
-	rec := reconcile.New(root, database)
+	// Per-reconcile ingest factory: a fresh single-vector session sharing the
+	// query DB's pools and ColBERT encoder, closed when the pass finishes.
+	newIngester := func() (reconcile.Ingester, error) {
+		single, closeSingle, err := singleEncoder(*c.encoder, *c.dim, *c.model, *c.provider)
+		if err != nil {
+			return nil, err
+		}
+		return &ingestDB{db: assembleDB(multi, single, pools, t), closeSingle: closeSingle}, nil
+	}
+
+	rec := reconcile.New(root, database, newIngester)
 	log.Printf("startup reconcile of %s …", root)
 	changed, err := rec.ReconcileAll(ctx)
 	if err != nil {
@@ -101,6 +134,22 @@ func runServe(args []string) error {
 	}
 	defer w.Close()
 	go svc.watchLoop(ctx, w, *resync, *maxStale)
+
+	// Diagnostics. The daemon's memory footprint is dominated by native ONNX
+	// Runtime allocations (not the Go heap), so watch process RSS against Go's
+	// own memstats: a growing rss-minus-Go-heap gap is native/ORT growth. pprof
+	// (opt-in via -debug-addr) covers the Go side if that ever climbs instead.
+	if *memlog > 0 {
+		go memLogLoop(ctx, *memlog)
+	}
+	if *debugAddr != "" {
+		go func() {
+			log.Printf("debug/pprof server on http://%s/debug/pprof/", *debugAddr)
+			if err := http.ListenAndServe(*debugAddr, nil); err != nil {
+				log.Printf("debug server: %v", err)
+			}
+		}()
+	}
 
 	server := mcp.NewServer(&mcp.Implementation{Name: "attndb", Version: "0.1.0"}, nil)
 	mcp.AddTool(server, &mcp.Tool{
@@ -165,6 +214,20 @@ type vaultService struct {
 	idleFloor int
 	recalSem  chan struct{} // size-1: at most one background recalibration
 }
+
+// ingestDB is a reconcile.Ingester backed by a DB whose single-vector session is
+// ephemeral: Close destroys that session (freeing the large-encode working set)
+// while the shared pools and ColBERT encoder live on.
+type ingestDB struct {
+	db          *db.DB
+	closeSingle func() error
+}
+
+func (i *ingestDB) Ingest(ctx context.Context, docs []core.Document) error {
+	return i.db.Ingest(ctx, docs)
+}
+
+func (i *ingestDB) Close() error { return i.closeSingle() }
 
 // watchLoop applies watcher batches to the index and drives the recalibration
 // policy: recalibrate when the corpus has drifted enough (churn ceiling) or has
@@ -265,6 +328,36 @@ func (s *vaultService) recalibrate(ctx context.Context) {
 		}
 		log.Printf("recalibrated from %d sample queries -> %s", len(samples), s.calibPath)
 	}()
+}
+
+// memLogLoop periodically logs Go runtime memory against process RSS. The Go GC
+// does not manage native (cgo/ONNX Runtime) allocations, so Go's own memstats
+// stay flat even as the process grows; the gap (RSS − Go Sys) is that native
+// footprint, and a steadily growing gap is the signal for a native leak or
+// arena retention. RSS is read via `ps` (no portable stdlib for it on darwin).
+func memLogLoop(ctx context.Context, every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	pid := strconv.Itoa(os.Getpid())
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+			goSysMiB := int64(m.Sys >> 20)
+			rssMiB, native := int64(-1), int64(-1)
+			if out, err := exec.Command("ps", "-o", "rss=", "-p", pid).Output(); err == nil {
+				if kb, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64); err == nil {
+					rssMiB = kb / 1024
+					native = rssMiB - goSysMiB
+				}
+			}
+			log.Printf("mem: rss=%dMiB native(rss-go.sys)=%dMiB go.sys=%dMiB go.heapAlloc=%dMiB go.heapSys=%dMiB numGC=%d goroutines=%d",
+				rssMiB, native, goSysMiB, m.HeapAlloc>>20, m.HeapSys>>20, m.NumGC, runtime.NumGoroutine())
+		}
+	}
 }
 
 // --- search_vault tool ---
