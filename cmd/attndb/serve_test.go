@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // testVault builds a vaultService over a fresh, canonicalized temp root with a
@@ -23,7 +24,7 @@ func testVault(t *testing.T) *vaultService {
 		t.Fatalf("open root: %v", err)
 	}
 	t.Cleanup(func() { rootFS.Close() })
-	return &vaultService{root: root, rootFS: rootFS}
+	return &vaultService{root: root, rootFS: rootFS, reads: newReadState()}
 }
 
 func TestVaultName(t *testing.T) {
@@ -206,6 +207,120 @@ func TestWriteDocAppend(t *testing.T) {
 	b, _ = os.ReadFile(filepath.Join(svc.root, "nonl.md"))
 	if string(b) != "replaced\n" {
 		t.Errorf("overwrite produced %q, want %q", b, "replaced\n")
+	}
+}
+
+// TestReadBeforeOverwrite covers the guard that reconstructs the host harness's
+// read-before-edit rule from the MCP session id. It drives guardOverwrite
+// directly because a non-empty session id cannot be fabricated on an SDK
+// ServerSession (ID() reads it from the live transport).
+func TestReadBeforeOverwrite(t *testing.T) {
+	svc := testVault(t)
+	ctx := context.Background()
+	const sess = "SESSION-A"
+
+	// Creating a document that does not exist needs no prior read.
+	if err := svc.guardOverwrite(sess, "new.md", "/new.md"); err != nil {
+		t.Errorf("creation should be allowed without a read: %v", err)
+	}
+
+	if _, _, err := svc.writeDoc(ctx, nil, writeDocInput{Path: "/note.md", Content: "v1\n"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Existing file, this session never read it -> refused.
+	if err := svc.guardOverwrite(sess, "note.md", "/note.md"); err == nil {
+		t.Error("expected overwrite without a prior read to be refused")
+	} else if !strings.Contains(err.Error(), "has not read it") {
+		t.Errorf("unhelpful error: %v", err)
+	}
+
+	// After reading the current bytes, the overwrite is allowed.
+	b, _ := os.ReadFile(filepath.Join(svc.root, "note.md"))
+	svc.reads.note(sess, "note.md", sha256Hex(b))
+	if err := svc.guardOverwrite(sess, "note.md", "/note.md"); err != nil {
+		t.Errorf("overwrite after read should be allowed: %v", err)
+	}
+
+	// Someone else changes the file: the recorded hash is stale, so the write is
+	// refused even though this session did read it. This is the case plain
+	// read-before-write tracking would miss.
+	if err := os.WriteFile(filepath.Join(svc.root, "note.md"), []byte("edited by a human\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.guardOverwrite(sess, "note.md", "/note.md"); err == nil {
+		t.Error("expected a stale read to block the overwrite")
+	} else if !strings.Contains(err.Error(), "changed on disk") {
+		t.Errorf("unhelpful staleness error: %v", err)
+	}
+
+	// A different session's read does not vouch for this one.
+	cur, _ := os.ReadFile(filepath.Join(svc.root, "note.md"))
+	svc.reads.note("SESSION-B", "note.md", sha256Hex(cur))
+	if err := svc.guardOverwrite(sess, "note.md", "/note.md"); err == nil {
+		t.Error("one session's read must not authorize another's overwrite")
+	}
+
+	// Fail open: no session id (stateless transport) allows the write.
+	if err := svc.guardOverwrite("", "note.md", "/note.md"); err != nil {
+		t.Errorf("missing session id should fail open, got: %v", err)
+	}
+}
+
+// TestWriteRefreshesReadState checks the ergonomics: after writing or editing,
+// the session knows the current contents, so it can write again without an
+// intervening read. Append is exempt from the guard entirely.
+func TestWriteRefreshesReadState(t *testing.T) {
+	svc := testVault(t)
+	ctx := context.Background()
+	const sess = "SESSION-A"
+
+	// Append to a fresh file, then to an existing one: never guarded.
+	for i := 0; i < 2; i++ {
+		if _, _, err := svc.writeDoc(ctx, nil, writeDocInput{Path: "/log.md", Content: "line\n", Append: true}); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+	}
+	// Simulate the handler having recorded the post-write state for this session.
+	b, _ := os.ReadFile(filepath.Join(svc.root, "log.md"))
+	svc.reads.note(sess, "log.md", sha256Hex(b))
+	if err := svc.guardOverwrite(sess, "log.md", "/log.md"); err != nil {
+		t.Errorf("overwrite after this session's own write should be allowed: %v", err)
+	}
+
+	// An edit also refreshes the record, so the following overwrite is allowed.
+	if _, _, err := svc.editDoc(ctx, nil, editDocInput{Path: "/log.md", OldString: "line\nline\n", NewString: "one\n"}); err != nil {
+		t.Fatalf("editDoc: %v", err)
+	}
+	after, _ := os.ReadFile(filepath.Join(svc.root, "log.md"))
+	svc.reads.note(sess, "log.md", sha256Hex(after))
+	if err := svc.guardOverwrite(sess, "log.md", "/log.md"); err != nil {
+		t.Errorf("overwrite after this session's own edit should be allowed: %v", err)
+	}
+}
+
+// TestReadStateSweep checks lazy expiry: sessions idle beyond readTTL are
+// dropped, recent ones survive, and sweeping is rate-limited.
+func TestReadStateSweep(t *testing.T) {
+	r := newReadState()
+	r.note("old", "a.md", "sum")
+	r.note("fresh", "b.md", "sum")
+	r.sessions["old"].at = time.Now().Add(-2 * readTTL)
+
+	r.sweep() // lastSweep is zero, so this one runs
+	if _, ok := r.sessions["old"]; ok {
+		t.Error("expired session should have been swept")
+	}
+	if _, ok := r.sessions["fresh"]; !ok {
+		t.Error("recent session should have survived the sweep")
+	}
+
+	// Rate limiting: a second sweep right away is a no-op even with a stale entry.
+	r.note("old2", "c.md", "sum")
+	r.sessions["old2"].at = time.Now().Add(-2 * readTTL)
+	r.sweep()
+	if _, ok := r.sessions["old2"]; !ok {
+		t.Error("sweep should be rate-limited by readSweepIval")
 	}
 }
 

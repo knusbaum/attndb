@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
@@ -15,6 +17,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -124,6 +127,7 @@ func runServe(args []string) error {
 		idle:      *idle,
 		idleFloor: *floor,
 		recalSem:  make(chan struct{}, 1),
+		reads:     newReadState(),
 	}
 	if changed > 0 {
 		svc.recalibrate(ctx) // fresh corpus → get calibration in line before serving
@@ -181,10 +185,13 @@ func runServe(args []string) error {
 			"creating parent folders as needed. Use it to save durable notes or research so they become " +
 			"searchable later. Set `append` to add `content` to the end of the document instead of replacing " +
 			"it (creating it if absent) — the right way to grow a running log or add a section, since it " +
-			"needs no read-modify-write round trip. A written document becomes searchable shortly after, not " +
-			"instantly — to confirm it landed, search again after a moment rather than expecting an immediate " +
-			"hit. To change part of an existing document prefer edit_doc over rewriting the whole thing. " +
-			"Paths must be inside the vault and end in .md.",
+			"needs no read-modify-write round trip. Overwriting a document that already exists requires " +
+			"having read it with read_doc first, and the file must not have changed since; if it has, read it " +
+			"again and redo the change against the current text. Creating a new document and appending are " +
+			"not restricted. A written document becomes searchable shortly after, not instantly — to confirm " +
+			"it landed, search again after a moment rather than expecting an immediate hit. To change part of " +
+			"an existing document prefer edit_doc over rewriting the whole thing. Paths must be inside the " +
+			"vault and end in .md.",
 	}, svc.writeDoc)
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "edit_doc",
@@ -218,6 +225,7 @@ type vaultService struct {
 	idle      time.Duration
 	idleFloor int
 	recalSem  chan struct{} // size-1: at most one background recalibration
+	reads     *readState    // per-MCP-session read tracking (read-before-overwrite)
 }
 
 // ingestDB is a reconcile.Ingester backed by a DB whose single-vector session is
@@ -470,6 +478,147 @@ func lineOf(text string, off int) int {
 
 const readDocDefaultLimit = 2000 // lines, matching the host Read tool's default
 
+// --- read-before-overwrite tracking ---
+//
+// The host Read/Edit pair is safe because the harness is stateful: it refuses an
+// Edit on a file the model has not read. MCP tools are stateless per call, but
+// Streamable HTTP does carry identity — the client is issued an Mcp-Session-Id at
+// initialize and echoes it on every request, which the SDK surfaces as
+// req.Session.ID(). That is enough to reconstruct the same guarantee.
+//
+// What is tracked is not merely "this session read this path" but the content
+// hash it saw. The vault is a directory a human edits concurrently (that is the
+// whole point of the watcher), so read-before-write alone still permits:
+//
+//	t0  model reads version A
+//	t1  human edits the file  -> version B
+//	t2  model overwrites B with its edit of A   <- data loss, but it did read
+//
+// Comparing hashes catches both: no record means it never read the file, and a
+// mismatch means the file moved under it.
+//
+// Scope: only whole-file overwrites are guarded. Creating a new file cannot
+// require a prior read, append is exempt by design (that is what it is for), and
+// edit_doc already carries its own assertion — old_string must match exactly and
+// uniquely, so it can only replace text the caller demonstrably had.
+//
+// Fail open: a client in stateless mode, or one that omits the header, has no
+// session ID. Writes are allowed with a warning rather than refused — this is a
+// footgun guard, not a security boundary (the server has no auth at all).
+
+// readTTL is how long a session's recorded reads stay valid. Sweeping is lazy —
+// the state is a few hashes per client and clients are few — so expiry only runs
+// when a write happens to notice the sweep interval has elapsed.
+const (
+	readTTL       = time.Hour
+	readSweepIval = 10 * time.Minute
+)
+
+type sessionReads struct {
+	seen map[string]string // vault-relative path -> sha256 of the whole file as read
+	at   time.Time         // last touched; drives lazy expiry
+}
+
+// readState records, per MCP session, the content hash of each document that
+// session has read. Safe for concurrent use.
+type readState struct {
+	mu        sync.Mutex
+	sessions  map[string]*sessionReads
+	lastSweep time.Time
+}
+
+func newReadState() *readState {
+	return &readState{sessions: map[string]*sessionReads{}}
+}
+
+// note records that sess observed name with content hash sum.
+func (r *readState) note(sess, name, sum string) {
+	if sess == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s := r.sessions[sess]
+	if s == nil {
+		s = &sessionReads{seen: map[string]string{}}
+		r.sessions[sess] = s
+	}
+	s.seen[name] = sum
+	s.at = time.Now()
+}
+
+// saw reports the hash sess last observed for name, and whether it has one.
+func (r *readState) saw(sess, name string) (string, bool) {
+	if sess == "" {
+		return "", false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s := r.sessions[sess]
+	if s == nil {
+		return "", false
+	}
+	s.at = time.Now()
+	sum, ok := s.seen[name]
+	return sum, ok
+}
+
+// sweep drops sessions untouched for longer than readTTL. Cheap and lazy: it
+// no-ops unless readSweepIval has passed since the last one.
+func (r *readState) sweep() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	if now.Sub(r.lastSweep) < readSweepIval {
+		return
+	}
+	r.lastSweep = now
+	for id, s := range r.sessions {
+		if now.Sub(s.at) > readTTL {
+			delete(r.sessions, id)
+		}
+	}
+}
+
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// sessionOf returns the MCP session ID for a request, or "" when there is none
+// (stateless transport, or a direct call in tests).
+func sessionOf(req *mcp.CallToolRequest) string {
+	if req == nil || req.Session == nil {
+		return ""
+	}
+	return req.Session.ID()
+}
+
+// guardOverwrite enforces read-before-overwrite for a whole-file write. It
+// returns nil when the write may proceed: the file is new, the session is
+// unidentifiable (fail open), or the session read exactly the bytes now on disk.
+func (s *vaultService) guardOverwrite(sess, name, apiPath string) error {
+	s.reads.sweep()
+	cur, err := s.rootFS.ReadFile(name)
+	if err != nil {
+		return nil // no existing file to clobber (or unreadable) — creation is fine
+	}
+	if sess == "" {
+		log.Printf("write_doc %s: no MCP session id; skipping read-before-overwrite check", apiPath)
+		return nil
+	}
+	sum, ok := s.reads.saw(sess, name)
+	if !ok {
+		return fmt.Errorf("%s already exists and this session has not read it: call read_doc first, "+
+			"or set append to add to it without replacing it", apiPath)
+	}
+	if now := sha256Hex(cur); now != sum {
+		return fmt.Errorf("%s changed on disk since you read it: call read_doc again and redo the "+
+			"change against the current text (use edit_doc to replace just the part you mean)", apiPath)
+	}
+	return nil
+}
+
 type readDocInput struct {
 	Path   string `json:"path" jsonschema:"absolute vault path of the document, e.g. /Research/2026-07-14-topic.md"`
 	Offset int    `json:"offset,omitempty" jsonschema:"1-based line to start reading from (default 1)"`
@@ -483,7 +632,7 @@ type readDocOutput struct {
 	TotalLines int    `json:"total_lines" jsonschema:"total number of lines in the document"`
 }
 
-func (s *vaultService) readDoc(_ context.Context, _ *mcp.CallToolRequest, in readDocInput) (*mcp.CallToolResult, readDocOutput, error) {
+func (s *vaultService) readDoc(_ context.Context, req *mcp.CallToolRequest, in readDocInput) (*mcp.CallToolResult, readDocOutput, error) {
 	name, err := vaultName(in.Path)
 	if err != nil {
 		return nil, readDocOutput{}, err
@@ -492,6 +641,9 @@ func (s *vaultService) readDoc(_ context.Context, _ *mcp.CallToolRequest, in rea
 	if err != nil {
 		return nil, readDocOutput{}, err
 	}
+	// Record the whole-file hash, not the returned window: a later overwrite
+	// replaces the entire document, so that is what must be unchanged.
+	s.reads.note(sessionOf(req), name, sha256Hex(b))
 	lines := strings.Split(string(b), "\n")
 	// A trailing newline yields a final empty element; drop it so line counts
 	// match what an editor shows. Remember whether it was there so the slice we
@@ -547,10 +699,18 @@ type writeDocOutput struct {
 	Path string `json:"path" jsonschema:"the absolute vault path written"`
 }
 
-func (s *vaultService) writeDoc(_ context.Context, _ *mcp.CallToolRequest, in writeDocInput) (*mcp.CallToolResult, writeDocOutput, error) {
+func (s *vaultService) writeDoc(_ context.Context, req *mcp.CallToolRequest, in writeDocInput) (*mcp.CallToolResult, writeDocOutput, error) {
 	name, err := vaultName(in.Path)
 	if err != nil {
 		return nil, writeDocOutput{}, err
+	}
+	sess := sessionOf(req)
+	// Only a whole-file overwrite can destroy text the caller never saw; append
+	// and creation are safe by construction.
+	if !in.Append {
+		if err := s.guardOverwrite(sess, name, in.Path); err != nil {
+			return nil, writeDocOutput{}, err
+		}
 	}
 	if dir := filepath.Dir(name); dir != "." {
 		if err := s.rootFS.MkdirAll(dir, 0o755); err != nil {
@@ -568,6 +728,12 @@ func (s *vaultService) writeDoc(_ context.Context, _ *mcp.CallToolRequest, in wr
 		verb = "Appended to"
 	} else if err := s.rootFS.WriteFile(name, []byte(in.Content), 0o644); err != nil {
 		return nil, writeDocOutput{}, err
+	}
+	// This session now knows the current contents, so a further write needs no
+	// re-read. Re-reading from disk keeps append correct too (its result is the
+	// old text plus the fragment, not in.Content).
+	if b, err := s.rootFS.ReadFile(name); err == nil {
+		s.reads.note(sess, name, sha256Hex(b))
 	}
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{
 		Text: fmt.Sprintf("%s %s (searchable shortly)", verb, in.Path),
@@ -611,7 +777,7 @@ type editDocOutput struct {
 	Replacements int    `json:"replacements" jsonschema:"number of occurrences replaced"`
 }
 
-func (s *vaultService) editDoc(_ context.Context, _ *mcp.CallToolRequest, in editDocInput) (*mcp.CallToolResult, editDocOutput, error) {
+func (s *vaultService) editDoc(_ context.Context, req *mcp.CallToolRequest, in editDocInput) (*mcp.CallToolResult, editDocOutput, error) {
 	name, err := vaultName(in.Path)
 	if err != nil {
 		return nil, editDocOutput{}, err
@@ -644,6 +810,9 @@ func (s *vaultService) editDoc(_ context.Context, _ *mcp.CallToolRequest, in edi
 	if err := s.rootFS.WriteFile(name, []byte(updated), 0o644); err != nil {
 		return nil, editDocOutput{}, err
 	}
+	// old_string matched, so this session demonstrably had the current text;
+	// record the result so a following overwrite isn't blocked by its own edit.
+	s.reads.note(sessionOf(req), name, sha256Hex([]byte(updated)))
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{
 		Text: fmt.Sprintf("Edited %s (%d replacement(s))", in.Path, n),
 	}}}, editDocOutput{Path: in.Path, Replacements: n}, nil

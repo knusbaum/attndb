@@ -248,6 +248,15 @@ sub-seconds, and each query is tens of ms.
   line range separately (`start_line`/`end_line`/`total_lines`), so text you read
   can go straight back into `edit_doc` as `old_string`. To grow a document, use
   `write_doc` with `append` rather than a read-modify-write round trip.
+- **Read before overwrite, enforced.** Streamable HTTP issues each client an
+  `Mcp-Session-Id`, so the server can record which documents a session has read
+  and the hash it saw. Overwriting an existing file requires a matching prior
+  read — which also catches the case bare read-tracking misses: if the file
+  changed on disk in between (a human editing the vault), the write is refused
+  instead of silently clobbering. Creating and appending are unrestricted, and
+  `edit_doc` already carries its own assertion via `old_string`. A client with no
+  session id (stateless transport) is allowed through with a log line — this is a
+  footgun guard, not a security boundary.
 
 Design notes: `docs/live-vault-index.md`. Namespaces (`-ns`) isolate independent
 indexes in one Qdrant (e.g. a vault vs. the sample corpus).
