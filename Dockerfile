@@ -29,7 +29,17 @@ ARG PYTHON_VERSION=3.11
 # image, and torch comes from PyTorch's CPU-only index because PyPI's Linux
 # wheel is the CUDA build (~2.5 GB of nvidia-* deps this offline, CPU-only
 # export never uses).
-FROM python:${PYTHON_VERSION}-slim AS models
+#
+# Pinned to BUILDPLATFORM — the machine running the build — not TARGETPLATFORM.
+# What this stage emits is architecture-independent data (ONNX graphs, weights,
+# tokenizer JSON; the .data files are byte-identical across hosts), so building
+# it for the target buys nothing and costs two ways:
+#   - correctness: pylate's transitive dep fast-plaid publishes no linux/aarch64
+#     wheel and no sdist, so `pip install colbert-export` cannot resolve there at
+#     all — on a native arm64 machine just as surely as under emulation;
+#   - speed: cross-building it would run the torch export under QEMU, the
+#     dense-FP workload emulation handles worst.
+FROM --platform=$BUILDPLATFORM python:${PYTHON_VERSION}-slim AS models
 ARG COLBERT_MODEL=lightonai/GTE-ModernColBERT-v1
 ARG TORCH_CPU_INDEX=https://download.pytorch.org/whl/cpu
 WORKDIR /
