@@ -1,6 +1,17 @@
 # Copy to Makefile.local (git-ignored) for machine-specific build settings.
 # The main Makefile does `-include Makefile.local`, so anything here is optional.
 
+# The Makefile picks the ONNX Runtime library name by `uname -s` (macOS
+# libonnxruntime.<ver>.dylib, Linux libonnxruntime.so.<ver>). Override the
+# version if libs/ holds a different ORT release:
+#
+# ORT_VERSION = 1.26.0
+#
+# Or point at a library outside libs/ entirely (e.g. a pip-installed ORT with
+# CoreML support on macOS):
+#
+# export ATTNDB_ORT_LIB = /path/to/libonnxruntime.dylib
+
 # POST_ONNX runs after `make onnx` builds the binary. On macOS, sign it with a
 # stable code-signing identity so a Full Disk Access grant survives rebuilds:
 # Go's default ad-hoc signature changes every build and drops the TCC grant,

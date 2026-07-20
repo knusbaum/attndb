@@ -22,5 +22,11 @@
 # Makefile.local.example. The .example file IS committed.
 /Makefile.local
 
+# Resolved by `pipenv install` per platform, NOT committed. A lock can hold only
+# one entry per package, but torch differs by platform on the CPU wheel index
+# (Linux 2.11.0+cpu vs macOS 2.11.0), so any single committed lock breaks the
+# other OS. The Pipfile pins what matters; let each machine resolve the rest.
+/Pipfile.lock
+
 # Agent session scratch (worktrees, eval scripts)
 /.claude/

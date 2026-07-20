@@ -5,13 +5,13 @@ go 1.26.2
 require (
 	github.com/daulet/tokenizers v1.27.0
 	github.com/fsnotify/fsevents v0.2.0
+	github.com/modelcontextprotocol/go-sdk v1.4.1
 	github.com/qdrant/go-client v1.18.2
-	github.com/yalue/onnxruntime_go v1.20.0
+	github.com/yalue/onnxruntime_go v1.31.0
 )
 
 require (
 	github.com/google/jsonschema-go v0.4.2 // indirect
-	github.com/modelcontextprotocol/go-sdk v1.4.1 // indirect
 	github.com/segmentio/asm v1.1.3 // indirect
 	github.com/segmentio/encoding v0.5.4 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
@@ -23,5 +23,3 @@ require (
 	google.golang.org/grpc v1.80.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 )
-
-replace github.com/yalue/onnxruntime_go => ../onnxruntime_go

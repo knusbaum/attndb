@@ -50,10 +50,10 @@ type SingleVector struct {
 }
 
 // NewSingleVector loads the model and tokenizer from modelDir (expects model.onnx
-// and tokenizer.json). provider is "cpu" or "coreml". envAlloc routes the
-// session's allocations through the mmap CPU allocator (used for the ephemeral
-// ingest session so its large freed buffers return to the OS).
-func NewSingleVector(modelDir, provider string, envAlloc bool) (*SingleVector, error) {
+// and tokenizer.json). provider is "cpu" or "coreml". noArena disables ORT's CPU
+// arena (used for the ephemeral ingest session, so its large per-encode buffers
+// are not pooled for the session's lifetime).
+func NewSingleVector(modelDir, provider string, noArena bool) (*SingleVector, error) {
 	if err := ensureEnv(); err != nil {
 		return nil, fmt.Errorf("onnx env: %w", err)
 	}
@@ -61,7 +61,7 @@ func NewSingleVector(modelDir, provider string, envAlloc bool) (*SingleVector, e
 	if err != nil {
 		return nil, fmt.Errorf("load tokenizer: %w", err)
 	}
-	opts, err := buildSessionOptions(provider, envAlloc)
+	opts, err := buildSessionOptions(provider, noArena)
 	if err != nil {
 		tk.Close()
 		return nil, err

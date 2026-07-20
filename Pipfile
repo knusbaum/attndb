@@ -3,6 +3,16 @@ url = "https://pypi.org/simple"
 verify_ssl = true
 name = "pypi"
 
+# On Linux, PyPI's torch wheel is the CUDA build: it pulls ~2.5 GB of nvidia-*
+# packages and refuses to import without them ("libcublasLt.so not found"). The
+# exports are CPU-only by design (export_single.py forces device="cpu"), so take
+# torch from PyTorch's CPU-only index there. macOS wheels on PyPI are already
+# CPU-only (no CUDA builds exist for darwin), so they stay on pypi.
+[[source]]
+url = "https://download.pytorch.org/whl/cpu"
+verify_ssl = true
+name = "pytorch-cpu"
+
 # Isolated environment for the one-time model exports (scripts/). Keeps the
 # heavy/conflicting ML tooling out of the global interpreter. The Go runtime
 # needs none of this. Usage:
@@ -12,6 +22,9 @@ name = "pypi"
 [packages]
 colbert-export = "*"  # pulls pylate, torch, transformers, sentence-transformers
 onnxscript = "*"      # torch.onnx export backend
+# Declared explicitly (not just pulled in by colbert-export) so the Linux build
+# resolves from the CPU-only index. See the pytorch-cpu source above.
+torch = {version = "*", index = "pytorch-cpu", markers = "sys_platform == 'linux'"}
 
 [requires]
 python_version = "3.11"

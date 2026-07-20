@@ -10,8 +10,16 @@ ONNX := CGO_LDFLAGS="-L$(LIBS)" go build -tags onnx
 
 # Runtime ONNX Runtime shared library. The onnx encoder dlopen's this exact path
 # (see internal/encode/onnx/colbert.go); exported so the ingest/search recipes
-# pick it up without the caller having to set it.
-export ATTNDB_ORT_LIB := $(LIBS)/libonnxruntime.1.27.0.dylib
+# pick it up without the caller having to set it. The filename differs per
+# platform: macOS libonnxruntime.<version>.dylib, Linux libonnxruntime.so.<version>.
+ORT_VERSION ?= 1.27.0
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+ORT_LIB_NAME := libonnxruntime.$(ORT_VERSION).dylib
+else
+ORT_LIB_NAME := libonnxruntime.so.$(ORT_VERSION)
+endif
+export ATTNDB_ORT_LIB := $(LIBS)/$(ORT_LIB_NAME)
 
 # POST_ONNX runs after `make onnx` builds the binary — a seam for machine-local
 # build steps that don't belong in this shared Makefile, chiefly codesigning on

@@ -287,8 +287,23 @@ of overlapping background timers).
 
 ### Net state of the memory work
 - **Leak: fixed** by one session-config line; verified flat across 3 passes.
-- The custom mmap allocator (fork) is still valuable: it returns the ~14 GiB
-  transient per-encode working set to the OS between encodes (RSS → ~1.5 GiB).
-  Without it that transient would sit in libmalloc too.
-- Follow-ups: `-memlog` should report committed footprint (not RSS); decide
-  whether to keep the fork/allocator or simplify now that the leak is gone.
+- The custom mmap allocator (fork) returned the ~14 GiB transient per-encode
+  working set to the OS between encodes (RSS → ~1.5 GiB). Without it that
+  transient sits in libmalloc until the ingest session is closed.
+- **DECIDED (2026-07-20): the fork is dropped.** The `replace
+  github.com/yalue/onnxruntime_go => ../onnxruntime_go` was experimental and
+  should never have been committed — it made the `onnx` build impossible to
+  compile without an undocumented sibling checkout. attndb now uses upstream
+  `yalue/onnxruntime_go v1.31.0`, which carries the same ORT 1.26 upgrade the
+  fork was based on and every API used here except `RegisterMmapCpuAllocator`.
+  What remains bounding ingest memory: `mlas.disable_kleidiai` (the actual leak
+  fix), the ephemeral per-reconcile ingest session (closed each pass, so the
+  transient is released then), `SetCpuMemArena(false)` on that session, and
+  `ATTNDB_MAX_SINGLE_LEN` to cap the working set.
+  **Not re-measured on Apple Silicon since the change** — the transient peak
+  during a pass is expected to be higher than with the mmap allocator, while the
+  flat across-pass floor (the thing that caused the OOM) is unaffected. Re-run
+  the multi-pass floor test on a Mac before trusting the daemon with a large
+  vault; if the transient proves painful, lower `ATTNDB_MAX_SINGLE_LEN` rather
+  than reviving the fork.
+- Follow-ups: `-memlog` should report committed footprint (not RSS).

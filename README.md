@@ -89,24 +89,47 @@ they link native libraries (ONNX Runtime + HF tokenizers). One-time setup:
    This produces `models/` (per-token ColBERT) and `models/single/` (single-vector),
    each with `model.onnx`, `model.onnx.data`, and `tokenizer.json`.
 
-2. **Fetch the tokenizer lib** into `libs/`:
+2. **Fetch the native libs** into `libs/` — both the tokenizer static lib
+   (linked at build) and the ONNX Runtime shared lib (dlopen'd at run time):
+   ```
+   mkdir -p libs
+   ```
    - **Linux (amd64)**:
      ```
      curl -sSL https://github.com/daulet/tokenizers/releases/download/v1.27.0/libtokenizers.linux-amd64.tar.gz | tar -xz -C libs
+     curl -sSL https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-linux-x64-1.27.0.tgz -o /tmp/ort.tgz
+     tar -xzf /tmp/ort.tgz -C /tmp
+     cp -a /tmp/onnxruntime-linux-x64-1.27.0/lib/libonnxruntime.so* libs/
      ```
    - **macOS (Apple Silicon)**:
      ```
      curl -sSL https://github.com/daulet/tokenizers/releases/download/v1.27.0/libtokenizers.darwin-arm64.tar.gz | tar -xz -C libs
+     curl -sSL https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-osx-arm64-1.27.0.tgz -o /tmp/ort.tgz
+     tar -xzf /tmp/ort.tgz -C /tmp
+     cp -a /tmp/onnxruntime-osx-arm64-1.27.0/lib/libonnxruntime.1.27.0.dylib libs/
      ```
+   The CoreML execution provider is only in the macOS build of ONNX Runtime; if
+   you want `-provider coreml`, a pip- or Homebrew-installed ORT dylib also works
+   (see the Metal section below).
 
-3. **Build and run** (ONNX Runtime is loaded at runtime from the path in
-   `internal/encode/onnx`, overridable via `ATTNDB_ORT_LIB`):
+3. **Build and run**:
    ```
-   CGO_LDFLAGS="-L$(pwd)/libs" go build -tags onnx -o attndb ./cmd/attndb
-   ./attndb -encoder onnx -store memory -k 3 "how long do we keep customer information"
+   make onnx        # or: CGO_LDFLAGS="-L$(pwd)/libs" go build -tags onnx -o attndb ./cmd/attndb
+   ./attndb query -encoder onnx -store memory -k 3 "how long do we keep customer information"
    ```
+   ONNX Runtime is dlopen'd at run time. The default path is resolved per
+   platform (`libs/libonnxruntime.so.<version>` on Linux,
+   `libs/libonnxruntime.<version>.dylib` on macOS — see
+   `internal/encode/onnx/colbert.go`); override it with `ATTNDB_ORT_LIB`, which
+   `make` sets for you.
 
-`models/` (~1.4 GB) and `libs/` (~50 MB) are build artifacts and are not committed.
+`models/` (~1.4 GB) and `libs/` (~70 MB) are build artifacts and are not committed.
+Neither is `Pipfile.lock`: a lock holds one entry per package, but torch differs
+by platform on the CPU wheel index (Linux `2.11.0+cpu` vs macOS `2.11.0`), so a
+committed lock would break whichever OS it wasn't generated on. `pipenv install`
+resolves it per machine — on Linux, torch comes from PyTorch's CPU-only index
+(PyPI's Linux wheel is the CUDA build and drags in ~2.5 GB of `nvidia-*`
+packages the offline, CPU-only export never uses).
 
 ## Metal/CoreML acceleration (macOS)
 

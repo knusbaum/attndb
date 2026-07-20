@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"runtime"
 	"sync"
 
 	"github.com/daulet/tokenizers"
@@ -40,10 +41,23 @@ const (
 // punctuation is ColBERT's document skiplist (config skiplist_words).
 const punctuation = `!"#$%&'()*+,-./:;<=>?@[\]^_` + "`" + `{|}~`
 
-// defaultLibPath is the ONNX Runtime shared library shipped alongside the
-// native libs in ./libs (resolved relative to the working dir); override with
-// ATTNDB_ORT_LIB. The Makefile sets ATTNDB_ORT_LIB explicitly.
-const defaultLibPath = "libs/libonnxruntime.1.27.0.dylib"
+// ortVersion is the ONNX Runtime release the ./libs layout is fetched from; it
+// appears in the shared library's filename on every platform.
+const ortVersion = "1.27.0"
+
+// defaultLibPath returns the ONNX Runtime shared library shipped alongside the
+// native libs in ./libs (resolved relative to the working dir). The file
+// extension and version placement are platform-specific — macOS names it
+// libonnxruntime.<version>.dylib, Linux libonnxruntime.so.<version>. Override
+// either with ATTNDB_ORT_LIB; the Makefile sets it explicitly.
+func defaultLibPath() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "libs/libonnxruntime." + ortVersion + ".dylib"
+	default:
+		return "libs/libonnxruntime.so." + ortVersion
+	}
+}
 
 var initOnce sync.Once
 var initErr error
@@ -52,16 +66,10 @@ func ensureEnv() error {
 	initOnce.Do(func() {
 		lib := os.Getenv("ATTNDB_ORT_LIB")
 		if lib == "" {
-			lib = defaultLibPath
+			lib = defaultLibPath()
 		}
 		ort.SetSharedLibraryPath(lib)
-		if initErr = ort.InitializeEnvironment(); initErr != nil {
-			return
-		}
-		// Register the mmap-backed CPU allocator. Sessions that opt in (see
-		// buildSessionOptions envAlloc) route large allocations through it so
-		// freed buffers are munmap'd back to the OS instead of pinned in libmalloc.
-		initErr = ort.RegisterMmapCpuAllocator()
+		initErr = ort.InitializeEnvironment()
 	})
 	return initErr
 }
@@ -70,9 +78,9 @@ func ensureEnv() error {
 // execution provider. For "coreml", it appends the CoreML EP targeting the
 // Metal GPU and enables verbose session logging so node-to-EP assignments are
 // visible on stderr. It errors loud if the CoreML EP is not available in the
-// loaded dylib — callers must not silently fall back to CPU.
+// loaded ONNX Runtime library — callers must not silently fall back to CPU.
 // The caller is responsible for calling opts.Destroy() after the session is created.
-func buildSessionOptions(provider string, envAlloc bool) (*ort.SessionOptions, error) {
+func buildSessionOptions(provider string, noArena bool) (*ort.SessionOptions, error) {
 	opts, err := ort.NewSessionOptions()
 	if err != nil {
 		return nil, fmt.Errorf("session options: %w", err)
@@ -87,22 +95,17 @@ func buildSessionOptions(provider string, envAlloc bool) (*ort.SessionOptions, e
 		opts.Destroy()
 		return nil, fmt.Errorf("disable kleidiai: %w", err)
 	}
-	// envAlloc routes this session's allocations through the env's registered
-	// mmap CPU allocator (see RegisterMmapCpuAllocator), so its large freed
-	// buffers are munmap'd back to the OS. Used for the ephemeral ingest session,
-	// whose big whole-doc encodes are the memory hog; the persistent query
-	// session leaves it off (ORT default arena). See docs/proposal-onnx-memory.md.
-	if envAlloc {
-		if err := opts.AddSessionConfigEntry("session.use_env_allocators", "1"); err != nil {
-			opts.Destroy()
-			return nil, fmt.Errorf("use_env_allocators: %w", err)
-		}
-		// Disable the per-session arena so allocations go straight to our
-		// registered device allocator (mmap/munmap). With the arena on, ORT would
-		// pool the buffers and our Free never runs until the pool is torn down.
+	// noArena disables ORT's per-session CPU arena, so freed buffers go back to
+	// the allocator each run instead of being pooled for the session's lifetime.
+	// Used for the ephemeral ingest session, whose big whole-doc encodes are the
+	// memory hog; the persistent query session keeps the arena (it is a
+	// throughput win for the small, repeated query encodes). Combined with
+	// closing the ingest session each reconcile pass, this bounds ingest's
+	// working set. See docs/proposal-onnx-memory.md.
+	if noArena {
 		if err := opts.SetCpuMemArena(false); err != nil {
 			opts.Destroy()
-			return nil, fmt.Errorf("disable arena for env alloc: %w", err)
+			return nil, fmt.Errorf("disable cpu arena: %w", err)
 		}
 	}
 	if provider == "coreml" {
