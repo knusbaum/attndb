@@ -70,16 +70,21 @@ sync. Paths are parameters, so the indexed document tree is configured exactly
 the way Qdrant's storage is:
 
 ```
-# export the models first — they are mounted, not baked into the image
 cp .env.example .env        # then set ATTNDB_DOCS to your vault
-docker compose up -d
+docker compose up -d        # builds on demand, then starts Qdrant + the daemon
 docker compose logs -f attndb
 ```
+
+**No host setup is required** — not the Python export, not the native libs. The
+image build pulls the encoders from HuggingFace and converts them to ONNX
+itself, so no weights need distributing. That stage costs several minutes and a
+few GB of RAM the first time; it is a cached layer afterwards. If you already
+exported weights and would rather skip it, uncomment the models bind mount in
+`docker-compose.yml`.
 
 | Variable | Default | What it is |
 |---|---|---|
 | `ATTNDB_DOCS` | `./vault` | the document tree to index and serve (read-write) |
-| `ATTNDB_MODELS` | `./models` | exported ONNX weights, mounted read-only |
 | `ATTNDB_STATE` | `./attndb_state` | generated calibration, persisted across restarts |
 | `QDRANT_STORAGE` | `./qdrant_storage` | Qdrant's data directory |
 | `ATTNDB_PORT` | `8765` | host port for the MCP endpoint |
@@ -103,9 +108,7 @@ docker buildx create --use --name attndb-builder
 docker buildx build --platform linux/amd64,linux/arm64 -t attndb .
 ```
 
-Two things worth knowing. The **models are mounted, not baked in** — the image
-stays ~150 MB and the ~1.3 GB of weights stay regenerable, but you must run the
-export step below before the first `up`. And a Linux container has **no
+One behavioral difference from running natively: a Linux container has **no
 FSEvents**, so change detection falls back to the portable poller
 (`ATTNDB_POLL`, default 30s) with `ATTNDB_RESYNC` as the bulk-operation
 backstop — edits show up in search within a poll interval rather than instantly.

@@ -8,14 +8,59 @@
 #
 #   docker buildx build --platform linux/amd64,linux/arm64 -t attndb .
 #
-# The ~1.3 GB of exported ONNX weights are NOT baked in — they are mounted at
-# run time (see docker-compose.yml). Export them on the host first; there is no
-# `attndb pull` yet.
+# The encoder weights are pulled from HuggingFace and converted to ONNX during
+# the build (the `models` stage), so nothing has to be distributed alongside the
+# image and there is no host export step. That stage is the expensive part —
+# minutes, and a few GB of RAM for the torch export — but it is a separate layer,
+# so it is cached across rebuilds and only re-runs when its inputs change.
+#
+# To skip it and use weights you already exported, mount them over
+# /opt/attndb/models at run time (see docker-compose.yml).
 
 ARG GO_VERSION=1.26
 ARG DEBIAN_SUITE=trixie
 ARG ORT_VERSION=1.27.0
 ARG TOKENIZERS_VERSION=1.27.0
+ARG PYTHON_VERSION=3.11
+
+# ---------- models ----------
+# Pull the encoders from HuggingFace and convert them to ONNX. Mirrors the
+# README's host export step, minus pipenv: pip is enough inside a throwaway
+# image, and torch comes from PyTorch's CPU-only index because PyPI's Linux
+# wheel is the CUDA build (~2.5 GB of nvidia-* deps this offline, CPU-only
+# export never uses).
+FROM python:${PYTHON_VERSION}-slim AS models
+ARG COLBERT_MODEL=lightonai/GTE-ModernColBERT-v1
+ARG TORCH_CPU_INDEX=https://download.pytorch.org/whl/cpu
+WORKDIR /
+
+# torch first, from the CPU index, so the transitive resolution below finds the
+# requirement already satisfied and never reaches for the CUDA build.
+RUN pip install --no-cache-dir --index-url ${TORCH_CPU_INDEX} torch \
+ && pip install --no-cache-dir colbert-export onnxscript
+
+# Per-token ColBERT -> /models. quantize=False: the int8 export is another
+# ~150 MB and the Go side only ever opens model.onnx.
+RUN python -c "from colbert_export import export_model; \
+    export_model('${COLBERT_MODEL}', output_dir='/models', quantize=False)"
+
+# Single-vector embedder -> /models/single (the script writes a relative path).
+COPY scripts/export_single.py /tmp/export_single.py
+RUN python /tmp/export_single.py
+
+# Fail the build loudly here rather than at container start if an export silently
+# produced nothing. The .onnx graph is only a couple of MB — the weights live in
+# the external .data file, so check that too (a truncated one would otherwise
+# pass and only blow up when ORT loads the session).
+RUN set -eux; \
+    for f in /models/model.onnx /models/tokenizer.json \
+             /models/single/model.onnx /models/single/tokenizer.json; do \
+      test -s "$f" || { echo "missing/empty: $f" >&2; exit 1; }; \
+    done; \
+    for f in /models/model.onnx.data /models/single/model.onnx.data; do \
+      sz=$(stat -c %s "$f" 2>/dev/null || echo 0); \
+      test "$sz" -gt 100000000 || { echo "weights too small: $f ($sz bytes)" >&2; exit 1; }; \
+    done
 
 # ---------- build ----------
 FROM golang:${GO_VERSION}-${DEBIAN_SUITE} AS build
@@ -66,13 +111,17 @@ RUN apt-get update \
 COPY --from=build /out/libs/libonnxruntime.so.${ORT_VERSION} /usr/local/lib/
 COPY --from=build /out/attndb /usr/local/bin/attndb
 
+# Weights converted in the models stage. Baked in, so the image is self-contained
+# and nothing needs distributing; mount over this path to supply your own.
+COPY --from=models /models /opt/attndb/models
+
 # The encoder dlopen's this exact path (overrides the ./libs default, which
 # assumes a source checkout).
 ENV ATTNDB_ORT_LIB=/usr/local/lib/libonnxruntime.so.${ORT_VERSION}
 
-# Mount points: the vault is read-write (the write_doc/edit_doc tools), the
-# models read-only, and state holds the generated calibration file.
-VOLUME ["/vault", "/models", "/state"]
+# Mount points: the vault is read-write (the write_doc/edit_doc tools) and state
+# holds the generated calibration file.
+VOLUME ["/vault", "/state"]
 EXPOSE 8765
 
 ENTRYPOINT ["attndb"]
@@ -80,6 +129,6 @@ ENTRYPOINT ["attndb"]
 # reach it from outside the container.
 CMD ["serve", "-store", "qdrant", "-qdrant", "qdrant:6334", \
      "-encoder", "onnx", "-provider", "cpu", \
-     "-docs", "/vault", "-model", "/models", \
+     "-docs", "/vault", "-model", "/opt/attndb/models", \
      "-calib", "/state/calibration.json", \
      "-addr", "0.0.0.0:8765"]

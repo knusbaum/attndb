@@ -31,8 +31,12 @@ services:
       start_period: 10s
 
   attndb:
+    # Built on demand by `docker compose up` (or `docker compose build`). The
+    # build pulls the encoders from HuggingFace and converts them to ONNX, so no
+    # weights need distributing — the first build is slow, then layer-cached.
     build:
       context: .
+      dockerfile: Dockerfile
       args:
         ORT_VERSION: "1.27.0"
     image: attndb:latest
@@ -47,9 +51,10 @@ services:
       # The indexed document tree. Read-write: the write_doc/edit_doc/delete_doc
       # MCP tools modify it, and the watcher re-indexes a beat later.
       - ${ATTNDB_DOCS:-./vault}:/vault
-      # Exported ONNX weights (~1.3 GB). Read-only, and mounted rather than baked
-      # into the image so it stays small and the weights stay regenerable.
-      - ${ATTNDB_MODELS:-./models}:/models:ro
+      # The ONNX weights are converted during the image build and baked in at
+      # /opt/attndb/models — nothing to mount. To reuse weights you exported on
+      # the host instead (skipping that build stage), uncomment:
+      #   - ./models:/opt/attndb/models:ro
       # Generated calibration, so it survives restarts instead of being recomputed.
       - ${ATTNDB_STATE:-./attndb_state}:/state
     command:
@@ -59,7 +64,7 @@ services:
       - -encoder=onnx
       - -provider=cpu
       - -docs=/vault
-      - -model=/models
+      - -model=/opt/attndb/models
       - -calib=/state/calibration.json
       - -addr=0.0.0.0:8765
       - -ns=${ATTNDB_NS:-vault}
