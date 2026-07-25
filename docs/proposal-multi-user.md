@@ -51,10 +51,15 @@ build a separate upload store or a second ingest path.
 
 The remote interface is a thin **read/write API over the backing filesystem**,
 MCP tools that operate on files in the watched folder. As built they mirror the
-shape of the host Read/Write/Edit tools (so an LLM already fluent in those uses
-them well); paths are **absolute within the vault** (`/` = the vault root) and
-confined via Go's `os.Root`:
+shape of the host Read/Write/Edit/Glob tools (so an LLM already fluent in those
+uses them well); paths are **absolute within the vault** (`/` = the vault root)
+and confined via Go's `os.Root`:
 
+- **`list_docs(pattern?, limit?)`** — the Glob analogue: list vault documents,
+  optionally filtered by a glob (`*`, `**`, `?`) matched against the whole vault
+  path, sorted most-recently-modified first. Discovery — browse a folder, check
+  whether a document already exists, or find a path with no `search_vault` hit to
+  start from — as opposed to matching by meaning.
 - **`write_doc(path, content, append?)`** — create/overwrite a file in the watched
   tree, or with `append` add to its end (creating it if absent). Indexing follows
   automatically via the watcher; the tool does not ingest directly.

@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net/http"
 	_ "net/http/pprof" // registers /debug/pprof handlers on DefaultServeMux (served only when -debug-addr is set)
@@ -14,7 +15,9 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -169,6 +172,17 @@ func runServe(args []string) error {
 			"you found nothing relevant rather than dressing up a weak hit. Use a small k (3–5) for focused " +
 			"questions; larger only when surveying. Always cite the path and line so the user can verify.",
 	}, svc.search)
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "list_docs",
+		Description: "List documents in the user's vault, optionally filtered by a glob `pattern` matched " +
+			"against the absolute vault path — e.g. `/daily/*.md` (one directory), `/Research/**/*.md` " +
+			"(any depth), or `/daily/2026-07-*.md`. `*` matches any run of characters except `/`, `**` also " +
+			"crosses `/`, `?` matches one character; omit `pattern` to list every document. Results are " +
+			"sorted most-recently-modified first. Use this to browse what exists, to check whether a document " +
+			"is already there before creating it (e.g. today's log), or to find a path when you don't have " +
+			"one from search_vault. This is a directory listing, not a content search — for that, use " +
+			"search_vault.",
+	}, svc.listDocs)
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "read_doc",
 		Description: "Read a document from the user's vault by its absolute vault path. Returns the text " +
@@ -459,12 +473,12 @@ func lineOf(text string, off int) int {
 	return 1 + strings.Count(text[:off], "\n")
 }
 
-// --- filesystem tools: read_doc / write_doc / edit_doc / delete_doc ---
+// --- filesystem tools: list_docs / read_doc / write_doc / edit_doc / delete_doc ---
 //
 // A thin read/write interface over the watched vault folder, mirroring the shape
-// of the host filesystem tools (Read/Write/Edit) so a model already fluent in
-// those performs well here. Paths are absolute *within the vault* ("/" = vault
-// root); vaultName maps them to the confined os.Root, which guarantees no
+// of the host filesystem tools (Glob/Read/Write/Edit) so a model already fluent
+// in those performs well here. Paths are absolute *within the vault* ("/" =
+// vault root); vaultName maps them to the confined os.Root, which guarantees no
 // operation escapes the tree. The write tools only touch the filesystem — they
 // never index directly: the watcher notices the change and the reconciler
 // indexes it a beat later, keeping the folder the sole sync entry point and the
@@ -476,7 +490,147 @@ func lineOf(text string, off int) int {
 // document before overwriting/editing it. edit_doc's unique-old_string
 // requirement is the safety net against blind edits.
 
-const readDocDefaultLimit = 2000 // lines, matching the host Read tool's default
+const (
+	readDocDefaultLimit  = 2000 // lines, matching the host Read tool's default
+	listDocsDefaultLimit = 200  // entries
+)
+
+// listDocsInput / listDocsOutput / docEntry — list_docs.
+
+type listDocsInput struct {
+	Pattern string `json:"pattern,omitempty" jsonschema:"glob matched against the absolute vault path, e.g. /daily/*.md or /Research/**/*.md; omit to list every document"`
+	Limit   int    `json:"limit,omitempty" jsonschema:"maximum entries to return (default 200)"`
+}
+
+type docEntry struct {
+	Path     string `json:"path" jsonschema:"absolute vault path"`
+	Bytes    int64  `json:"bytes" jsonschema:"file size in bytes"`
+	Modified string `json:"modified" jsonschema:"last modified time, RFC3339"`
+}
+
+type listDocsOutput struct {
+	Docs      []docEntry `json:"docs" jsonschema:"matches, most recently modified first"`
+	Total     int        `json:"total" jsonschema:"total matches before limit was applied"`
+	Truncated bool       `json:"truncated" jsonschema:"true when total exceeds the returned docs; narrow pattern or raise limit"`
+}
+
+// vaultGlob compiles a shell-style glob into a regexp matched against a
+// slash-separated vault path. Supports `*` (any run of characters except `/`,
+// within one path segment), `**` (zero or more whole path segments, so it
+// matches across `/`), and `?` (exactly one character except `/`); everything
+// else matches literally. Deliberately this small a subset — no character
+// classes, no brace expansion — so a caller can predict what a pattern does
+// without consulting shell-glob edge cases.
+//
+// `**` is handled per path segment, not per character: a naive char-by-char
+// translation of "a/**/b" produces "a/.*b/", which still requires a literal
+// '/' either side of the ".*" and so fails to match "a/b" itself (zero
+// intervening segments) — exactly the case a running log's daily-file check
+// (`/daily/**/*.md` matching a file directly in `/daily/`) depends on.
+func vaultGlob(pattern string) (*regexp.Regexp, error) {
+	segs := strings.Split(pattern, "/")
+	var b strings.Builder
+	b.WriteString("^")
+	for i, seg := range segs {
+		last := i == len(segs)-1
+		if seg == "**" {
+			if last {
+				b.WriteString(".*")
+			} else {
+				b.WriteString("(?:[^/]+/)*") // zero or more full segments, each with its '/'
+			}
+			continue // already consumed its own separator; don't emit another
+		}
+		for _, r := range seg {
+			switch r {
+			case '*':
+				b.WriteString("[^/]*")
+			case '?':
+				b.WriteString("[^/]")
+			default:
+				b.WriteString(regexp.QuoteMeta(string(r)))
+			}
+		}
+		if !last {
+			b.WriteString("/")
+		}
+	}
+	b.WriteString("$")
+	return regexp.Compile(b.String())
+}
+
+// listDocs walks the vault via the confined os.Root filesystem (never the raw
+// host path), so it can never see outside the tree, into hidden directories, or
+// list a non-.md file the other tools couldn't touch anyway.
+func (s *vaultService) listDocs(_ context.Context, _ *mcp.CallToolRequest, in listDocsInput) (*mcp.CallToolResult, listDocsOutput, error) {
+	var match *regexp.Regexp
+	if in.Pattern != "" {
+		p := strings.TrimPrefix(in.Pattern, "/")
+		re, err := vaultGlob(p)
+		if err != nil {
+			return nil, listDocsOutput{}, fmt.Errorf("invalid pattern %q: %w", in.Pattern, err)
+		}
+		match = re
+	}
+
+	type hit struct {
+		rel     string
+		size    int64
+		modTime time.Time
+	}
+	var hits []hit
+	err := fs.WalkDir(s.rootFS.FS(), ".", func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if p == "." {
+			return nil
+		}
+		if strings.HasPrefix(path.Base(p), ".") {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() || !corpus.IsIndexable(p) {
+			return nil
+		}
+		if match != nil && !match.MatchString(p) {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		hits = append(hits, hit{rel: p, size: info.Size(), modTime: info.ModTime()})
+		return nil
+	})
+	if err != nil {
+		return nil, listDocsOutput{}, err
+	}
+	sort.Slice(hits, func(i, j int) bool { return hits[i].modTime.After(hits[j].modTime) })
+
+	total := len(hits)
+	limit := in.Limit
+	if limit <= 0 {
+		limit = listDocsDefaultLimit
+	}
+	if len(hits) > limit {
+		hits = hits[:limit]
+	}
+	docs := make([]docEntry, len(hits))
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d document(s)", total)
+	if total > len(hits) {
+		fmt.Fprintf(&b, " (showing %d)", len(hits))
+	}
+	for i, h := range hits {
+		docs[i] = docEntry{Path: "/" + h.rel, Bytes: h.size, Modified: h.modTime.Format(time.RFC3339)}
+		fmt.Fprintf(&b, "\n%s\t%d bytes\t%s", docs[i].Path, docs[i].Bytes, docs[i].Modified)
+	}
+	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: b.String()}}},
+		listDocsOutput{Docs: docs, Total: total, Truncated: total > len(docs)}, nil
+}
 
 // --- read-before-overwrite tracking ---
 //

@@ -50,8 +50,13 @@ about *what* to record matters more than the writing.
 
 ## 3. Dedup — update in place, don't clone
 
-Always `search_vault` the topic before writing. If a closely related note
-already exists:
+Always `search_vault` the topic before writing. Semantic search can miss an
+existing note it should have caught (paraphrase mismatch, a thin note with
+little to match on) — if you have a good guess at the filename or folder (a
+dated note, a known topic slug), also `list_docs` it (e.g.
+`/Research/*topic*.md` — a pattern matches the whole path, so keep the `.md`)
+as a belt-and-suspenders check before deciding to create new. If a closely
+related note already exists:
 - `read_doc` it, then **update it in place**. Pick the narrowest tool that does
   the job:
   - **adding to the end** (a new finding, a dated entry) → `write_doc` with

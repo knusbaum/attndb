@@ -13,9 +13,18 @@ description: >
 # attndb-search — query the personal vault
 
 attndb indexes the user's document vault (for the primary user, an Obsidian note
-vault) and exposes one MCP tool, `search_vault`, which returns calibrated
-relevance scores. This skill is about reaching for it at the right moments and
-reading the results correctly.
+vault) and exposes `search_vault` — a semantic search returning calibrated
+relevance scores — plus `list_docs`, a plain directory listing (optionally
+glob-filtered) for when you need to browse or check what exists rather than
+match on meaning. This skill is about reaching for the right one at the right
+moment and reading the results correctly.
+
+**Search vs. list.** `search_vault` answers "what in the vault is relevant to
+this question" — use it for anything content-shaped. `list_docs` answers "what
+files are here" — use it to browse a folder, confirm a document already exists
+before creating it (e.g. today's log), or find a path when you don't have one
+from a search hit. Don't use `list_docs` to find content by topic; that's what
+search is for.
 
 ## When to search
 

@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // testVault builds a vaultService over a fresh, canonicalized temp root with a
@@ -322,6 +324,131 @@ func TestReadStateSweep(t *testing.T) {
 	if _, ok := r.sessions["old2"]; !ok {
 		t.Error("sweep should be rate-limited by readSweepIval")
 	}
+}
+
+func TestVaultGlob(t *testing.T) {
+	cases := []struct {
+		pattern, path string
+		want          bool
+	}{
+		{"daily/*.md", "daily/2026-07-20.md", true},
+		{"daily/*.md", "daily/sub/2026-07-20.md", false}, // * does not cross '/'
+		{"daily/**/*.md", "daily/sub/2026-07-20.md", true},
+		{"daily/**/*.md", "daily/2026-07-20.md", true}, // ** also matches zero segments
+		{"**/*.md", "Research/2026/topic.md", true},
+		{"*.md", "top.md", true},
+		{"*.md", "sub/top.md", false},
+		{"daily/2026-07-??.md", "daily/2026-07-20.md", true},
+		{"daily/2026-07-??.md", "daily/2026-07-2.md", false}, // ? matches exactly one char
+		{"Research/*.md", "research/x.md", false},            // literal chars are case-sensitive
+		{"a.b.md", "aXbXmd", false},                          // literal '.' must not behave as regex wildcard
+		{"a.b.md", "a.b.md", true},
+	}
+	for _, c := range cases {
+		re, err := vaultGlob(c.pattern)
+		if err != nil {
+			t.Fatalf("vaultGlob(%q): %v", c.pattern, err)
+		}
+		if got := re.MatchString(c.path); got != c.want {
+			t.Errorf("vaultGlob(%q).Match(%q) = %v, want %v", c.pattern, c.path, got, c.want)
+		}
+	}
+}
+
+// TestListDocs covers pattern filtering, hidden-path/non-md exclusion, recency
+// sort, and the limit/truncated accounting.
+func TestListDocs(t *testing.T) {
+	svc := testVault(t)
+	ctx := context.Background()
+
+	write := func(relPath, content string, age time.Duration) {
+		p := "/" + relPath
+		if _, _, err := svc.writeDoc(ctx, nil, writeDocInput{Path: p, Content: content}); err != nil {
+			t.Fatalf("writeDoc %s: %v", p, err)
+		}
+		mt := time.Now().Add(-age)
+		if err := os.Chtimes(filepath.Join(svc.root, relPath), mt, mt); err != nil {
+			t.Fatalf("chtimes %s: %v", relPath, err)
+		}
+	}
+	write("daily/2026-07-19.md", "old\n", 2*time.Hour)
+	write("daily/2026-07-20.md", "new\n", 1*time.Hour)
+	write("Research/topic.md", "research\n", 30*time.Minute)
+	// Not real files, created directly on disk (bypassing writeDoc's .md-only
+	// policy) so listDocs is proven to filter them, not merely never encounter
+	// them.
+	if err := os.MkdirAll(filepath.Join(svc.root, ".obsidian"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(svc.root, ".obsidian", "config.md"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(svc.root, "notes.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// No pattern: every .md, most recent first, hidden dir and non-.md excluded.
+	_, out, err := svc.listDocs(ctx, nil, listDocsInput{})
+	if err != nil {
+		t.Fatalf("listDocs: %v", err)
+	}
+	if out.Total != 3 {
+		t.Fatalf("total = %d, want 3 (got %+v)", out.Total, out.Docs)
+	}
+	wantOrder := []string{"/Research/topic.md", "/daily/2026-07-20.md", "/daily/2026-07-19.md"}
+	for i, w := range wantOrder {
+		if out.Docs[i].Path != w {
+			t.Errorf("Docs[%d] = %s, want %s (recency order wrong)", i, out.Docs[i].Path, w)
+		}
+	}
+	if out.Truncated {
+		t.Error("should not be truncated under the default limit")
+	}
+
+	// Pattern scoped to one directory.
+	_, out, err = svc.listDocs(ctx, nil, listDocsInput{Pattern: "/daily/*.md"})
+	if err != nil {
+		t.Fatalf("listDocs pattern: %v", err)
+	}
+	if out.Total != 2 {
+		t.Errorf("pattern total = %d, want 2", out.Total)
+	}
+	for _, d := range out.Docs {
+		if !strings.HasPrefix(d.Path, "/daily/") {
+			t.Errorf("pattern leaked non-daily path: %s", d.Path)
+		}
+	}
+
+	// Limit truncates but total still reports the full count.
+	_, out, err = svc.listDocs(ctx, nil, listDocsInput{Limit: 1})
+	if err != nil {
+		t.Fatalf("listDocs limit: %v", err)
+	}
+	if len(out.Docs) != 1 || out.Total != 3 || !out.Truncated {
+		t.Errorf("limit=1: got %d docs, total=%d, truncated=%v; want 1, 3, true", len(out.Docs), out.Total, out.Truncated)
+	}
+}
+
+// TestToolRegistration guards against a gap the handler-level tests below can't
+// see: they call e.g. svc.listDocs directly, bypassing mcp.AddTool's reflection
+// over the input/output struct tags entirely. A malformed jsonschema tag (a real
+// risk on a new tool with a nested struct/slice output like docEntry) would only
+// surface here, or in the live server — this is cheaper than restarting a real
+// daemon to find out.
+func TestToolRegistration(t *testing.T) {
+	svc := testVault(t)
+	server := mcp.NewServer(&mcp.Implementation{Name: "attndb-test", Version: "0"}, nil)
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("registering a tool panicked (bad schema tag?): %v", r)
+		}
+	}()
+	mcp.AddTool(server, &mcp.Tool{Name: "search_vault", Description: "d"}, svc.search)
+	mcp.AddTool(server, &mcp.Tool{Name: "list_docs", Description: "d"}, svc.listDocs)
+	mcp.AddTool(server, &mcp.Tool{Name: "read_doc", Description: "d"}, svc.readDoc)
+	mcp.AddTool(server, &mcp.Tool{Name: "write_doc", Description: "d"}, svc.writeDoc)
+	mcp.AddTool(server, &mcp.Tool{Name: "edit_doc", Description: "d"}, svc.editDoc)
+	mcp.AddTool(server, &mcp.Tool{Name: "delete_doc", Description: "d"}, svc.deleteDoc)
 }
 
 func TestEditDocUniqueness(t *testing.T) {
