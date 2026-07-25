@@ -2,11 +2,16 @@
 #
 # attndb MCP document server.
 #
-# Multi-arch (linux/amd64 + linux/arm64): the native dependencies are fetched
-# per TARGETARCH, so the same Dockerfile builds on an x86 server and an Apple
-# Silicon laptop. Build both with buildx:
-#
-#   docker buildx build --platform linux/amd64,linux/arm64 -t attndb .
+# Multi-arch (linux/amd64 + linux/arm64) IMAGES, built from an amd64 HOST: the
+# native dependencies are fetched per TARGETARCH, so one build produces both
+# architectures. The models stage pins to BUILDPLATFORM (see below) because its
+# pip dependency has no linux/aarch64 wheel — so the build host itself must be
+# amd64 today; an arm64 host (e.g. Docker Desktop on Apple Silicon) cannot build
+# this image for any target. A single foreign-arch build works on the default
+# builder (docker buildx build --platform linux/arm64 -t attndb:arm64 --load .);
+# both architectures in one command needs the container driver, since the
+# default `docker` driver cannot export a multi-platform manifest list — see
+# docs/building.md for the full sequence.
 #
 # The encoder weights are pulled from HuggingFace and converted to ONNX during
 # the build (the `models` stage), so nothing has to be distributed alongside the
