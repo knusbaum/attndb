@@ -115,13 +115,16 @@ cross-compiles with a Debian cross toolchain (`gcc/g++-<arch>-linux-gnu` +
 ONNX (pinned to `--platform=$BUILDPLATFORM` in the Dockerfile). Nothing foreign
 executes during a build — it is only written.
 
-**The build host itself must be amd64, though.** `pylate` (via `colbert-export`)
-pulls in `fast-plaid`, which publishes no `linux/aarch64` wheel and no sdist —
-so the models stage's `pip install` cannot resolve on a native arm64 Linux
-machine, emulated or not (see below). That means an arm64 build host — a Mac
-using Docker Desktop, whose Linux VM is arm64 — cannot build this image for
-*either* target today. Build on an amd64 host (or amd64 CI runner); once built,
-the resulting images run fine on arm64.
+**One dependency needed a workaround to build on an arm64 host.** `pylate` (via
+`colbert-export`) pulls in `fast-plaid`, which publishes no `linux/aarch64`
+wheel or sdist on PyPI — root cause: it links `libtorch` via the Rust `tch`
+crate, and PyTorch itself doesn't publish a standalone linux/aarch64 `libtorch`
+archive (only macOS-arm64 and Windows-arm64 exist). `third_party/` carries a wheel
+built from fast-plaid's own source via true cross-compilation (no emulation) —
+see `scripts/build-fastplaid-aarch64.sh`. The models stage installs it on
+aarch64 instead of hitting PyPI. Rebuild it (and update the pin below) when
+bumping the `TORCH_VERSION` build arg — the wheel is linked against one exact
+torch version and won't work with a different one at runtime.
 
 ```
 # your own architecture
@@ -150,9 +153,7 @@ races: observed here as every child exiting into a zombie while the parent spun
 at 100% CPU, livelocked past 26 minutes, after an identical earlier build had
 happened to succeed in 149s. Cross-compiled, the same step takes ~11s.
 
-The model-export stage has the same constraint in the other direction: it's
-pinned to the build machine because `pylate` (via `colbert-export`) pulls in
-`fast-plaid`, which publishes no `linux/aarch64` wheel and no sdist — so it
-cannot resolve on a native arm64 Linux machine either, emulated or not. What the
-stage produces is architecture-independent data, so building it anywhere but the
-host gains nothing and risks that failure for no reason.
+The model-export stage is pinned to the build machine for a different reason:
+what it produces is architecture-independent data, so building it anywhere but
+the host gains nothing. See the fast-plaid wheel note above for the one
+dependency that needed a vendored build to resolve on arm64 at all.

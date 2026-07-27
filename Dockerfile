@@ -2,16 +2,16 @@
 #
 # attndb MCP document server.
 #
-# Multi-arch (linux/amd64 + linux/arm64) IMAGES, built from an amd64 HOST: the
-# native dependencies are fetched per TARGETARCH, so one build produces both
-# architectures. The models stage pins to BUILDPLATFORM (see below) because its
-# pip dependency has no linux/aarch64 wheel — so the build host itself must be
-# amd64 today; an arm64 host (e.g. Docker Desktop on Apple Silicon) cannot build
-# this image for any target. A single foreign-arch build works on the default
-# builder (docker buildx build --platform linux/arm64 -t attndb:arm64 --load .);
-# both architectures in one command needs the container driver, since the
-# default `docker` driver cannot export a multi-platform manifest list — see
-# docs/building.md for the full sequence.
+# Multi-arch (linux/amd64 + linux/arm64): the native dependencies are fetched
+# per TARGETARCH, so the same Dockerfile builds on an x86 server or an Apple
+# Silicon host. The models stage pins to BUILDPLATFORM (see below); on an
+# arm64 build host it uses a vendored fast-plaid wheel (third_party/, see
+# scripts/build-fastplaid-aarch64.sh) since PyPI has none for linux/aarch64. A
+# single foreign-arch build works on the default builder (docker buildx build
+# --platform linux/arm64 -t attndb:arm64 --load .); both architectures in one
+# command needs the container driver, since the default `docker` driver
+# cannot export a multi-platform manifest list — see docs/building.md for the
+# full sequence.
 #
 # The encoder weights are pulled from HuggingFace and converted to ONNX during
 # the build (the `models` stage), so nothing has to be distributed alongside the
@@ -38,21 +38,39 @@ ARG PYTHON_VERSION=3.11
 # Pinned to BUILDPLATFORM — the machine running the build — not TARGETPLATFORM.
 # What this stage emits is architecture-independent data (ONNX graphs, weights,
 # tokenizer JSON; the .data files are byte-identical across hosts), so building
-# it for the target buys nothing and costs two ways:
-#   - correctness: pylate's transitive dep fast-plaid publishes no linux/aarch64
-#     wheel and no sdist, so `pip install colbert-export` cannot resolve there at
-#     all — on a native arm64 machine just as surely as under emulation;
-#   - speed: cross-building it would run the torch export under QEMU, the
-#     dense-FP workload emulation handles worst.
+# it for the target buys nothing.
+#
+# pylate's transitive dep fast-plaid publishes no linux/aarch64 wheel or sdist on
+# PyPI (root cause: it links libtorch via the `tch` Rust crate, and PyTorch itself
+# doesn't publish a standalone linux/aarch64 libtorch archive — only macOS-arm64
+# and Windows-arm64). third_party/ carries a wheel we cross-compiled ourselves (see
+# scripts/build-fastplaid-aarch64.sh and docs/building.md); on aarch64 it's
+# installed from there instead of PyPI. torch is pinned to the exact version that
+# wheel was linked against — required for aarch64 (ABI-specific), and pinned on
+# amd64 too so both platforms build against one known-working version rather than
+# whatever is newest on the day of the build.
 FROM --platform=$BUILDPLATFORM python:${PYTHON_VERSION}-slim AS models
 ARG COLBERT_MODEL=lightonai/GTE-ModernColBERT-v1
 ARG TORCH_CPU_INDEX=https://download.pytorch.org/whl/cpu
+ARG TORCH_VERSION=2.9.0
 WORKDIR /
 
+COPY third_party/ /tmp/third_party/
+
 # torch first, from the CPU index, so the transitive resolution below finds the
-# requirement already satisfied and never reaches for the CUDA build.
-RUN pip install --no-cache-dir --index-url ${TORCH_CPU_INDEX} torch \
- && pip install --no-cache-dir colbert-export onnxscript
+# requirement already satisfied and never reaches for the CUDA build. On
+# aarch64, install the vendored fast-plaid wheel before colbert-export so pip
+# finds it already satisfied instead of failing over to PyPI (no wheel there).
+# libgomp1 is fast-plaid's native runtime dependency, not bundled in our wheel
+# since it's built with --manylinux off (see the build script for why).
+RUN set -eux; \
+    pip install --no-cache-dir --index-url ${TORCH_CPU_INDEX} torch==${TORCH_VERSION}; \
+    if [ "$(uname -m)" = "aarch64" ]; then \
+      apt-get update && apt-get install -y --no-install-recommends libgomp1 \
+        && rm -rf /var/lib/apt/lists/*; \
+      pip install --no-cache-dir /tmp/third_party/fast_plaid-*-linux_aarch64.whl; \
+    fi; \
+    pip install --no-cache-dir colbert-export onnxscript
 
 # Per-token ColBERT -> /models. quantize=False: the int8 export is another
 # ~150 MB and the Go side only ever opens model.onnx.
