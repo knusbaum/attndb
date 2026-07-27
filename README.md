@@ -8,13 +8,13 @@ files change. Only Markdown (`.md`) files are indexed and addressable, for now.
 
 What makes it worth using over "just embed everything": matches localize to the
 **exact passage** that answered the question, not just the document, and scores
-are calibrated — a weak, uncertain match is reported as one instead of being
-dressed up to look confident.
+are calibrated — searches return relevant passages across your entire document
+corpus, allowing agents to quickly find the information they need.
 
 ## Quickstart
 
-Requirements: Docker and Docker Compose. Nothing else — no Python, no native
-libraries to install; the image build handles all of that itself.
+Requirements: Docker and Docker Compose. Nothing else —  the image build handles
+all dependencies itself.
 
 ```
 git clone <this repo> && cd attndb
