@@ -80,7 +80,7 @@ func ensureEnv() error {
 // visible on stderr. It errors loud if the CoreML EP is not available in the
 // loaded ONNX Runtime library — callers must not silently fall back to CPU.
 // The caller is responsible for calling opts.Destroy() after the session is created.
-func buildSessionOptions(provider string, noArena bool) (*ort.SessionOptions, error) {
+func buildSessionOptions(provider, modelPath string, noArena bool) (*ort.SessionOptions, error) {
 	opts, err := ort.NewSessionOptions()
 	if err != nil {
 		return nil, fmt.Errorf("session options: %w", err)
@@ -108,7 +108,9 @@ func buildSessionOptions(provider string, noArena bool) (*ort.SessionOptions, er
 			return nil, fmt.Errorf("disable cpu arena: %w", err)
 		}
 	}
-	if provider == "coreml" {
+	switch provider {
+	case "cpu":
+	case "coreml":
 		// Verbose logging exposes which nodes ORT assigns to CoreMLExecutionProvider
 		// vs CPUExecutionProvider. Watch stderr for "Node ... assigned to ...".
 		if err := opts.SetLogSeverityLevel(ort.LoggingLevelVerbose); err != nil {
@@ -122,6 +124,14 @@ func buildSessionOptions(provider string, noArena bool) (*ort.SessionOptions, er
 			opts.Destroy()
 			return nil, fmt.Errorf("CoreML EP unavailable (is the dylib built with CoreML support?): %w", err)
 		}
+	case "migraphx":
+		if err := appendMIGraphX(opts, modelPath); err != nil {
+			opts.Destroy()
+			return nil, err
+		}
+	default:
+		opts.Destroy()
+		return nil, fmt.Errorf("unknown ONNX provider %q (want cpu, coreml, or migraphx)", provider)
 	}
 	return opts, nil
 }
@@ -131,13 +141,12 @@ type ColBERT struct {
 	tk       *tokenizers.Tokenizer
 	sess     *ort.DynamicAdvancedSession
 	skiplist map[uint32]bool
-	padded   bool // pad inputs to fixed shapes (queryLen/docLen) for CoreML static graph
+	padded   bool // pad inputs to fixed query and document shapes for GPU compilation
 	mu       sync.Mutex
 }
 
 // NewColBERT loads the model and tokenizer from modelDir (expects model.onnx and
-// tokenizer.json). provider is "cpu" or "coreml"; "coreml" enables the CoreML
-// execution provider for Metal GPU acceleration.
+// tokenizer.json) with the requested execution provider.
 func NewColBERT(modelDir, provider string) (*ColBERT, error) {
 	if err := ensureEnv(); err != nil {
 		return nil, fmt.Errorf("onnx env: %w", err)
@@ -146,24 +155,34 @@ func NewColBERT(modelDir, provider string) (*ColBERT, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load tokenizer: %w", err)
 	}
-	opts, err := buildSessionOptions(provider, false) // ColBERT (300-token cap) isn't the memory hog
+	modelPath := modelDir + "/model.onnx"
+	opts, err := buildSessionOptions(provider, modelPath, false)
 	if err != nil {
 		tk.Close()
 		return nil, err
 	}
 	defer opts.Destroy()
-	sess, err := ort.NewDynamicAdvancedSession(modelDir+"/model.onnx",
+	sess, err := ort.NewDynamicAdvancedSession(modelPath,
 		[]string{"input_ids", "attention_mask"}, []string{"output"}, opts)
 	if err != nil {
 		tk.Close()
 		return nil, fmt.Errorf("load model: %w", err)
 	}
-	return &ColBERT{
+	encoder := &ColBERT{
 		tk:       tk,
 		sess:     sess,
 		skiplist: buildSkiplist(tk),
-		padded:   provider == "coreml",
-	}, nil
+		padded:   provider != "cpu",
+	}
+	if provider == "migraphx" {
+		for _, length := range []int{queryLen, docLen} {
+			if _, err := encoder.run([]int64{clsID, dID, sepID}, []int64{1, 1, 1}, length); err != nil {
+				encoder.Close()
+				return nil, fmt.Errorf("warm up ColBERT on MIGraphX at length %d: %w", length, err)
+			}
+		}
+	}
+	return encoder, nil
 }
 
 func (c *ColBERT) Dim() int { return dim }
@@ -218,9 +237,7 @@ func (c *ColBERT) encode(text string, isDoc bool) (core.TokenVecs, error) {
 		mask[i] = 1
 	}
 
-	// For CoreML we pad to the fixed model caps so the graph compiles as a
-	// static shape. Without this, CoreML can't partition the transformer
-	// graph and silently falls back to CPU for all ops.
+	// Limit GPU compilation to the two fixed input shapes.
 	fixedLen := 0
 	if c.padded {
 		if isDoc {

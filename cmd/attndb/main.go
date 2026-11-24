@@ -71,7 +71,7 @@ commands:
   serve    long-running daemon: watch docs, keep the index synced, search over MCP
 
 common flags: -store memory|qdrant  -qdrant host:port  -encoder stub|onnx
-              -provider cpu|coreml  -model dir  -dim N  -docs dir
+              -provider cpu|coreml|migraphx  -model dir  -dim N  -docs dir
 search/query: -k N  -filter key=value
 `)
 }
@@ -90,7 +90,7 @@ func registerCommon(fs *flag.FlagSet) *common {
 		store:    fs.String("store", "memory", "vector store: memory | qdrant"),
 		qaddr:    fs.String("qdrant", "localhost:6334", "qdrant gRPC host:port"),
 		encoder:  fs.String("encoder", "stub", "encoder: stub | onnx"),
-		provider: fs.String("provider", "cpu", "onnx execution provider: cpu | coreml (Mac/Metal)"),
+		provider: fs.String("provider", "cpu", "onnx execution provider: cpu | coreml (Mac/Metal) | migraphx (AMD GPU)"),
 		model:    fs.String("model", "models", "model directory (onnx encoder)"),
 		docs:     fs.String("docs", "./sample_docs", "documents directory"),
 		calib:    fs.String("calib", ".attndb-calibration.json", "calibration file (written by ingest, read by search)"),

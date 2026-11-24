@@ -3,21 +3,32 @@
 package main
 
 import (
+	"log"
+	"time"
+
 	"github.com/kjn/attndb/internal/core"
 	"github.com/kjn/attndb/internal/encode/onnx"
 )
 
 // onnxEncoders builds the real encoders: GTE-ModernColBERT for per-token passes
 // and a dedicated gte-modernbert-base single-vector embedder (in <modelDir>/single)
-// for the pooled passes. provider is "cpu" or "coreml".
+// for the pooled passes.
 func onnxEncoders(modelDir, provider string) (core.MultiVectorEncoder, core.SingleVectorEncoder, error) {
+	start := time.Now()
+	if provider == "migraphx" {
+		log.Print("warming ColBERT and pooled encoder on MIGraphX")
+	}
 	cb, err := onnx.NewColBERT(modelDir, provider)
 	if err != nil {
 		return nil, nil, err
 	}
 	sv, err := onnx.NewSingleVector(modelDir+"/single", provider, false) // query session: keep the CPU arena
 	if err != nil {
+		cb.Close()
 		return nil, nil, err
+	}
+	if provider == "migraphx" {
+		log.Printf("MIGraphX encoders ready in %s", time.Since(start).Round(time.Millisecond))
 	}
 	return cb, sv, nil
 }

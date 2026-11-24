@@ -28,6 +28,25 @@ several minutes and a few GB of RAM, once. After that you have an MCP endpoint
 at `http://localhost:8765` that indexes `ATTNDB_DOCS` and keeps it current as
 files change.
 
+### AMD GPU encoding on Linux
+
+Build the native ONNX binary with `make onnx`. Install AMD's MIGraphX ONNX
+Runtime plugin and its matching ROCm and ONNX Runtime libraries. Set
+`ATTNDB_ORT_LIB` to that ONNX Runtime shared library and
+`ATTNDB_MIGRAPHX_EP_LIB` to the plugin's `libmigraphx-ep.so`. Make their
+dependencies visible to the dynamic loader. See [AMD's installation guide](https://rocm.docs.amd.com/projects/ai-ecosystem/en/latest/inference/onnxruntime.html).
+
+```sh
+./attndb serve -store qdrant -encoder onnx -provider migraphx -docs /path/to/vault
+```
+
+The provider runs ColBERT and both pooled passes in FP32 with ONNX Runtime CPU
+fallback disabled. Startup prepares the query and document shapes and `serve`
+keeps both sessions resident across reconciles. The pooled shapes respect
+`ATTNDB_MAX_SINGLE_LEN` (default 8192). Set `ATTNDB_MIGRAPHX_CACHE_DIR` to a
+writable directory to reuse compiled programs across processes. The cache
+includes model weights and can take several GiB.
+
 ## Connect it to your AI assistant
 
 **Claude Code:**

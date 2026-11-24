@@ -74,12 +74,9 @@ func runServe(args []string) error {
 	defer rootFS.Close()
 	ctx := context.Background()
 
-	// Build the query DB explicitly (rather than c.database()) so the memory-heavy
-	// ingest path can reuse the shared pools and ColBERT encoder while swapping in
-	// a fresh, ephemeral single-vector session per reconcile. The query session
-	// (in `database`) only ever encodes short queries and stays small; large
-	// document encodes live in the ephemeral ingest session, which is closed after
-	// each pass so its memory returns to the OS. See docs/proposal-onnx-memory.md.
+	// Share the pools and ColBERT encoder between search and ingest. CPU and
+	// CoreML ingest use an ephemeral pooled session to bound memory across
+	// passes. See docs/proposal-onnx-memory.md.
 	mk, err := poolFactory(*c.store, *c.qaddr)
 	if err != nil {
 		return err
@@ -101,14 +98,16 @@ func runServe(args []string) error {
 		database.SetCalibration(calib)
 	}
 
-	// Per-reconcile ingest factory: a fresh single-vector session sharing the
-	// query DB's pools and ColBERT encoder, closed when the pass finishes.
-	newIngester := func() (reconcile.Ingester, error) {
-		single, closeSingle, err := singleEncoder(*c.encoder, *c.dim, *c.model, *c.provider)
-		if err != nil {
-			return nil, err
+	var newIngester func() (reconcile.Ingester, error)
+	// MIGraphX keeps both compiled sessions alive across queries and reconciles.
+	if *c.provider != "migraphx" {
+		newIngester = func() (reconcile.Ingester, error) {
+			single, closeSingle, err := singleEncoder(*c.encoder, *c.dim, *c.model, *c.provider)
+			if err != nil {
+				return nil, err
+			}
+			return &ingestDB{db: assembleDB(multi, single, pools, t), closeSingle: closeSingle}, nil
 		}
-		return &ingestDB{db: assembleDB(multi, single, pools, t), closeSingle: closeSingle}, nil
 	}
 
 	rec := reconcile.New(root, database, newIngester)

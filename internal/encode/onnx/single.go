@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"sync"
 
@@ -43,14 +44,15 @@ const coreMlSingleLen = 512
 // over a sentence-transformers model exported with pooling + L2 normalization
 // baked into the ONNX graph, so the output is already one normalized vector.
 type SingleVector struct {
-	tk     *tokenizers.Tokenizer
-	sess   *ort.DynamicAdvancedSession
-	padded bool // pad to coreMlSingleLen for CoreML static shape
-	mu     sync.Mutex
+	tk      *tokenizers.Tokenizer
+	sess    *ort.DynamicAdvancedSession
+	seqCap  int
+	lengths []int // padded sequence lengths, ascending
+	mu      sync.Mutex
 }
 
 // NewSingleVector loads the model and tokenizer from modelDir (expects model.onnx
-// and tokenizer.json). provider is "cpu" or "coreml". noArena disables ORT's CPU
+// and tokenizer.json). noArena disables ORT's CPU
 // arena (used for the ephemeral ingest session, so its large per-encode buffers
 // are not pooled for the session's lifetime).
 func NewSingleVector(modelDir, provider string, noArena bool) (*SingleVector, error) {
@@ -61,19 +63,43 @@ func NewSingleVector(modelDir, provider string, noArena bool) (*SingleVector, er
 	if err != nil {
 		return nil, fmt.Errorf("load tokenizer: %w", err)
 	}
-	opts, err := buildSessionOptions(provider, noArena)
+	modelPath := modelDir + "/model.onnx"
+	opts, err := buildSessionOptions(provider, modelPath, noArena)
 	if err != nil {
 		tk.Close()
 		return nil, err
 	}
 	defer opts.Destroy()
-	sess, err := ort.NewDynamicAdvancedSession(modelDir+"/model.onnx",
+	sess, err := ort.NewDynamicAdvancedSession(modelPath,
 		[]string{"input_ids", "attention_mask"}, []string{"sentence_embedding"}, opts)
 	if err != nil {
 		tk.Close()
 		return nil, fmt.Errorf("load model: %w", err)
 	}
-	return &SingleVector{tk: tk, sess: sess, padded: provider == "coreml"}, nil
+	encoder := &SingleVector{tk: tk, sess: sess, seqCap: maxSingleLen}
+	if provider == "coreml" {
+		encoder.seqCap = coreMlSingleLen
+		encoder.lengths = []int{coreMlSingleLen}
+	}
+	if provider == "migraphx" {
+		// Keep at most four compiled programs resident and use the smallest
+		// shape that fits each input. The last shape preserves the token cap.
+		for _, length := range []int{128, 512, 2048} {
+			if length < encoder.seqCap {
+				encoder.lengths = append(encoder.lengths, length)
+			}
+		}
+		encoder.lengths = append(encoder.lengths, encoder.seqCap)
+		for _, length := range encoder.lengths {
+			ids, mask := make([]int64, length), make([]int64, length)
+			mask[0] = 1
+			if _, err := encoder.run(ids, mask); err != nil {
+				encoder.Close()
+				return nil, fmt.Errorf("warm up pooled encoder on MIGraphX at length %d: %w", length, err)
+			}
+		}
+	}
+	return encoder, nil
 }
 
 func (s *SingleVector) Dim() int { return singleDim }
@@ -105,21 +131,10 @@ func (s *SingleVector) encode(text string) ([]float32, error) {
 
 	// addSpecialTokens=true: the model expects [CLS] … [SEP]. No ColBERT markers.
 	enc := s.tk.EncodeWithOptions(text, true)
-	seqCap := maxSingleLen
-	if s.padded {
-		seqCap = coreMlSingleLen
-	}
-	n := len(enc.IDs)
-	if n > seqCap {
-		n = seqCap
-	}
-
-	// For CoreML we pad to a fixed length so the graph compiles as a static
-	// shape. Without this, CoreML can't partition the transformer and silently
-	// falls back to CPU for all ops.
+	n := min(len(enc.IDs), s.seqCap)
 	allocLen := n
-	if s.padded && allocLen < coreMlSingleLen {
-		allocLen = coreMlSingleLen
+	if len(s.lengths) > 0 {
+		allocLen = s.lengths[sort.SearchInts(s.lengths, n)]
 	}
 	ids := make([]int64, allocLen)
 	mask := make([]int64, allocLen)
@@ -128,8 +143,11 @@ func (s *SingleVector) encode(text string) ([]float32, error) {
 		mask[i] = 1
 	}
 	// ids[n:] and mask[n:] are already zero (pad token, masked out)
+	return s.run(ids, mask)
+}
 
-	shape := ort.NewShape(1, int64(allocLen))
+func (s *SingleVector) run(ids, mask []int64) ([]float32, error) {
+	shape := ort.NewShape(1, int64(len(ids)))
 	idT, err := ort.NewTensor(shape, ids)
 	if err != nil {
 		return nil, err
