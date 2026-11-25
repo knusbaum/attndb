@@ -21,3 +21,9 @@ __pycache__/
 /.github/
 /.claude/
 /Makefile.local
+
+# Never send local interpolation files or credentials to either Docker build.
+.env
+.env.*
+secrets/
+*.bcrypt

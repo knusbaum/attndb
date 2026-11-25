@@ -4,6 +4,10 @@ For running attndb day to day, use Docker — see the [README](../README.md). Th
 doc is for building the binary yourself (native encoders, CoreML, multi-arch
 images) or developing attndb itself.
 
+For the separate AMD gfx1151 GPU image candidate, pinned userspace packages,
+build recipe and acceptance tests, see [MIGraphX GPU container](gpu-container.md).
+The default Dockerfile remains CPU-only.
+
 ## Default build (stub encoders)
 
 No native dependencies. Deterministic hash embeddings — enough to exercise the

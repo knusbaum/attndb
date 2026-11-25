@@ -40,6 +40,8 @@ func main() {
 	args := os.Args[2:]
 	var err error
 	switch os.Args[1] {
+	case "auth-hash":
+		err = runAuthHash(args)
 	case "ingest":
 		err = runIngest(args)
 	case "search":
@@ -65,6 +67,7 @@ func usage() {
 	fmt.Fprint(os.Stderr, `usage: attndb <command> [flags] [query...]
 
 commands:
+  auth-hash  create a salted password hash via hidden terminal prompts (-out new-file)
   ingest   encode documents and store them (use -store qdrant to persist)
   search   query an already-ingested store (no re-encoding)
   query    one-shot: ingest then search in one process (good for -store memory)

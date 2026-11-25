@@ -9,6 +9,8 @@ import (
 
 	"github.com/kjn/attndb/internal/core"
 	"github.com/qdrant/go-client/qdrant"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // Qdrant is a Pool backed by a Qdrant collection. Single-vector pools use a
@@ -203,6 +205,19 @@ func (q *Qdrant) query(ctx context.Context, query *qdrant.Query, k int, filters 
 		WithPayload:    qdrant.NewWithPayload(true),
 	})
 	if err != nil {
+		// Collections are created only on first ingest; a fresh, empty vault
+		// therefore has nothing to query yet. Confirm absence rather than
+		// swallowing every NotFound (which can refer to other resources).
+		// Do not cache absence: a later ingest may create the collection.
+		if status.Code(err) == codes.NotFound {
+			exists, existsErr := q.client.CollectionExists(ctx, q.name)
+			if existsErr != nil {
+				return nil, fmt.Errorf("qdrant exists %s after query NotFound: %w", q.name, existsErr)
+			}
+			if !exists {
+				return []Scored{}, nil
+			}
+		}
 		return nil, fmt.Errorf("qdrant query %s: %w", q.name, err)
 	}
 	out := make([]Scored, 0, len(points))

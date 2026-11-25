@@ -11,6 +11,9 @@ What makes it worth using over "just embed everything": matches localize to the
 are calibrated — searches return relevant passages across your entire document
 corpus, allowing agents to quickly find the information they need.
 
+AMD GPU container preparation: see the [MIGraphX image and validation contract](docs/gpu-container.md).
+It is a separate, unvalidated candidate; the default container remains CPU-only.
+
 ## Quickstart
 
 Requirements: Docker and Docker Compose. Nothing else —  the image build handles
@@ -60,10 +63,17 @@ undo.
 suffix). For a client that only speaks stdio, bridge with
 `npx mcp-remote http://localhost:8765`.
 
-The server has no built-in auth, so leave it on `localhost` unless you put a
-reverse proxy with TLS + a token in front of it (see
-`docs/proposal-multi-user.md`) — the write tools below can modify your
-documents.
+Local development remains unauthenticated by default; keep it on `localhost`.
+For remote access, enable the built-in **single-user OAuth** layer and put TLS
+in front of it. It supports discovery, dynamic client registration, S256 PKCE,
+shared-password browser approval, and persistent rotating tokens. Production
+configuration stores only a salted bcrypt verifier; create it with
+`attndb auth-hash -out <new-hash-file>` using hidden terminal prompts. Any partial
+auth configuration fails startup rather than silently disabling protection.
+See [MCP auth configuration](docs/mcp-auth.md) for flags, secret files, state
+storage, local testing, and the future `https://attn.knusbaum.com/mcp` endpoint.
+Authorization grants **all tools**, including writes/deletes; it is not the
+[proposed multi-user model](docs/proposal-multi-user.md).
 
 ## What your assistant can do with it
 

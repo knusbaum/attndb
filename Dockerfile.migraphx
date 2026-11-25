@@ -1,0 +1,101 @@
+# syntax=docker/dockerfile:1
+# Candidate gfx1151 userspace; build/GPU acceptance is mandatory before rollout.
+# Reuse Dockerfile's architecture-independent models target (see docs/gpu-container.md).
+ARG GO_VERSION=1.26.2
+ARG UBUNTU_VERSION=24.04
+ARG MODELS_IMAGE=attndb-models:local
+FROM ${MODELS_IMAGE} AS models
+FROM golang:${GO_VERSION}-bookworm AS go-toolchain
+
+# Compile cgo against the SAME Ubuntu libc as runtime, not Debian trixie.
+FROM ubuntu:${UBUNTU_VERSION} AS build
+ARG TARGETARCH
+ARG TOKENIZERS_VERSION=1.27.0
+RUN test "$TARGETARCH" = amd64
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl build-essential \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=go-toolchain /usr/local/go /usr/local/go
+ENV PATH=/usr/local/go/bin:$PATH GOTOOLCHAIN=local
+WORKDIR /src
+RUN mkdir -p /out/libs && curl -fSL \
+      "https://github.com/daulet/tokenizers/releases/download/v${TOKENIZERS_VERSION}/libtokenizers.linux-amd64.tar.gz" \
+      -o /tmp/tokenizers.tgz \
+    && tar -xzf /tmp/tokenizers.tgz -C /out/libs && rm /tmp/tokenizers.tgz
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=1 CGO_LDFLAGS="-L/out/libs" \
+      go build -tags onnx -trimpath -o /out/attndb ./cmd/attndb \
+    && CGO_ENABLED=1 CGO_LDFLAGS="-L/out/libs" \
+      go build -tags onnx -trimpath -o /out/attndb-gpu-smoke ./cmd/attndb-gpu-smoke
+
+FROM ubuntu:${UBUNTU_VERSION} AS runtime
+ARG TARGETARCH
+ARG ROCM_VERSION=10.2.0
+ARG MIGRAPHX_VERSION=2.19.0
+ARG ORT_VERSION=1.29.0
+ARG MIGRAPHX_EP_VERSION=1.0.0
+ARG GPU_TARGET=gfx1151
+RUN test "$TARGETARCH" = amd64 && test "$GPU_TARGET" = gfx1151
+# devel supplies the native compiler/header layout for MIGraphX runtime JIT.
+# No kernel modules or amdgpu installer belong in this image.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates python3.12-venv build-essential libnuma1 libelf1t64 \
+      libdrm2 libgomp1 libtinfo6 libzstd1 zlib1g \
+    && rm -rf /var/lib/apt/lists/*
+ENV VIRTUAL_ENV=/opt/attndb/venv
+ENV PATH=/opt/attndb/venv/bin:/opt/rocm/bin:$PATH
+RUN python3.12 -m venv "$VIRTUAL_ENV" \
+    && python -m pip install --no-cache-dir \
+      --index-url https://stable.repo.amd.com/rocm/whl-next/ \
+      "rocm[libraries,devel,device-${GPU_TARGET}]==${ROCM_VERSION}" \
+    && python -m pip install --no-cache-dir \
+      --index-url https://stable.repo.amd.com/rocm/migraphx/whl-next/ \
+      "migraphx==${MIGRAPHX_VERSION}+rocm${ROCM_VERSION}" \
+      "migraphx-libs==${MIGRAPHX_VERSION}+rocm${ROCM_VERSION}" \
+    && python -m pip install --no-cache-dir \
+      --extra-index-url https://stable.repo.amd.com/rocm/onnxruntime/whl-next/ \
+      "onnxruntime==${ORT_VERSION}" \
+      "onnxruntime-ep-migraphx==${MIGRAPHX_EP_VERSION}+rocm${ROCM_VERSION}" \
+    && python -m pip check \
+    && rocm-sdk init \
+    && ln -s "$(rocm-sdk path --root)" /opt/rocm \
+    && python -m pip freeze > /opt/attndb/python-packages.txt
+
+# Preserve the entire wheel layout: ROCm uses relative RPATHs and kernel packs.
+# Native Go does not import Python to preload dependencies.
+ENV ROCM_PATH=/opt/rocm \
+    ATTNDB_ORT_LIB=/opt/attndb/venv/lib/python3.12/site-packages/onnxruntime/capi/libonnxruntime.so.${ORT_VERSION} \
+    ATTNDB_MIGRAPHX_EP_LIB=/opt/attndb/venv/lib/python3.12/site-packages/onnxruntime_ep_migraphx/libmigraphx-ep.so \
+    LD_LIBRARY_PATH=/opt/attndb/venv/lib/python3.12/site-packages/onnxruntime/capi:/opt/attndb/venv/lib/python3.12/site-packages/migraphx_libs:/opt/rocm/lib:/opt/rocm/lib64
+# Establish the ORT SONAME and fail on missing native dependencies at build time.
+# CDLL loads libraries only; actual device enumeration/inference is a runtime gate.
+RUN test -s "$ATTNDB_ORT_LIB" && test -s "$ATTNDB_MIGRAPHX_EP_LIB" \
+    && ln -sf "libonnxruntime.so.${ORT_VERSION}" "$(dirname "$ATTNDB_ORT_LIB")/libonnxruntime.so.1" \
+    && python -c 'import ctypes, os; [ctypes.CDLL(os.environ[k]) for k in ("ATTNDB_ORT_LIB", "ATTNDB_MIGRAPHX_EP_LIB")]'
+
+COPY --from=build /out/attndb /out/attndb-gpu-smoke /usr/local/bin/
+COPY --from=models /models /opt/attndb/models
+COPY --chmod=0755 scripts/smoke-migraphx.sh /usr/local/bin/smoke-migraphx
+RUN for d in /opt/attndb/models /opt/attndb/models/single; do \
+      for f in model.onnx model.onnx.data tokenizer.json; do \
+        test -s "$d/$f" || { echo "missing/empty model artifact: $d/$f" >&2; exit 1; }; \
+      done; \
+    done \
+    && groupadd --gid 10001 attndb \
+    && useradd --uid 10001 --gid 10001 --home-dir /state --no-create-home attndb \
+    && mkdir -p /vault /state \
+    && chown 10001:10001 /vault /state
+ENV HOME=/state \
+    XDG_CACHE_HOME=/state/cache \
+    ATTNDB_MIGRAPHX_CACHE_DIR=/state/migraphx/rocm${ROCM_VERSION}-migraphx${MIGRAPHX_VERSION}-ort${ORT_VERSION}-${GPU_TARGET} \
+    ATTNDB_MAX_SINGLE_LEN=512
+USER 10001:10001
+VOLUME ["/vault", "/state"]
+EXPOSE 8765
+ENTRYPOINT ["attndb"]
+CMD ["serve", "-store", "qdrant", "-qdrant", "qdrant:6334", \
+     "-encoder", "onnx", "-provider", "migraphx", \
+     "-docs", "/vault", "-model", "/opt/attndb/models", \
+     "-calib", "/state/calibration.json", "-addr", "0.0.0.0:8765"]

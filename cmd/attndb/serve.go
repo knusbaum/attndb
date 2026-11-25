@@ -28,6 +28,7 @@ import (
 	"github.com/kjn/attndb/internal/core"
 	"github.com/kjn/attndb/internal/corpus"
 	"github.com/kjn/attndb/internal/db"
+	"github.com/kjn/attndb/internal/mcpauth"
 	"github.com/kjn/attndb/internal/reconcile"
 	"github.com/kjn/attndb/internal/watch"
 )
@@ -39,6 +40,7 @@ import (
 func runServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	c := registerCommon(fs)
+	authConfig := mcpauth.Flags(fs)
 	addr := fs.String("addr", "localhost:8765", "HTTP listen address for the MCP server")
 	poll := fs.Duration("poll", 30*time.Second, "poll interval for the fallback watcher (no native FSEvents)")
 	resync := fs.Duration("resync", 5*time.Minute, "periodic full ReconcileAll backstop (catches bulk/dir ops the granular watcher misses)")
@@ -49,6 +51,12 @@ func runServe(args []string) error {
 	debugAddr := fs.String("debug-addr", "", "if set, serve net/http/pprof + debug on this address (e.g. localhost:6060)")
 	memlog := fs.Duration("memlog", 5*time.Minute, "interval to log Go memstats + process RSS (0 disables); the rss-minus-Go-heap gap is native/ONNX memory")
 	fs.Parse(args)
+
+	auth, err := mcpauth.New(*authConfig)
+	if err != nil {
+		return fmt.Errorf("MCP auth: %w", err)
+	}
+	defer auth.Close()
 
 	if *c.store != "qdrant" {
 		return fmt.Errorf("serve requires -store qdrant (the index must persist across restarts)")
@@ -220,9 +228,29 @@ func runServe(args []string) error {
 			"searchable shortly after removal. Paths must be inside the vault and end in .md.",
 	}, svc.deleteDoc)
 
-	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil)
+	handler := newMCPHTTPHandler(server, auth)
 	log.Printf("attndb MCP server listening on http://%s (ns=%q, docs=%s)", *addr, *c.ns, root)
-	return http.ListenAndServe(*addr, handler)
+	if auth == nil {
+		log.Printf("WARNING: MCP authentication is disabled; use loopback for local development only")
+	}
+	// No WriteTimeout: Streamable HTTP may hold SSE responses open.
+	httpServer := &http.Server{Addr: *addr, Handler: handler, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, IdleTimeout: 2 * time.Minute, MaxHeaderBytes: 32 << 10}
+	return httpServer.ListenAndServe()
+}
+
+// newMCPHTTPHandler keeps the SDK's local DNS-rebinding/CSRF protection in
+// unauthenticated mode. In authenticated mode the outer layer accepts only
+// explicit bearer credentials, never ambient cookies: browser clients may be
+// cross-origin and a loopback reverse proxy may preserve the public Host.
+func newMCPHTTPHandler(server *mcp.Server, auth *mcpauth.Server) http.Handler {
+	opts := &mcp.StreamableHTTPOptions{}
+	if auth != nil {
+		opts.DisableLocalhostProtection = true
+		opts.CrossOriginProtection = &http.CrossOriginProtection{}
+		opts.CrossOriginProtection.AddInsecureBypassPattern("/")
+	}
+	transport := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, opts)
+	return auth.Handler(transport)
 }
 
 // vaultService bundles the resident DB, reconciler, and calibration policy that
